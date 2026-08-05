@@ -4,22 +4,43 @@ import '../../core/api_response.dart';
 import '../../exceptions/api_exception.dart';
 import '../../interfaces/api_adapter.dart';
 import '../../interfaces/api_interceptor.dart';
+import '../adapter_mixin.dart';
 
-
-/// An adapter that wraps the `dio` package client.
-class DioAdapter implements ApiAdapter {
+/// An adapter that wraps the `dio` package HTTP client.
+///
+/// Translates unified [ApiRequest] and [ApiResponse] types to and from
+/// Dio's native request/response types, while running all requests
+/// through the shared [InterceptorPipeline].
+///
+/// {@tool snippet}
+/// ```dart
+/// final adapter = DioAdapter(
+///   baseUrl: 'https://api.example.com',
+///   defaultHeaders: {'Accept': 'application/json'},
+///   interceptors: [retryInterceptor, loggerInterceptor],
+/// );
+///
+/// final response = await adapter.request<Map<String, dynamic>>(
+///   const ApiRequest(path: '/users/1'),
+/// );
+/// ```
+/// {@end-tool}
+class DioAdapter extends ApiAdapter with InterceptorPipeline {
   final dio.Dio _client;
-  
+
   @override
   final String baseUrl;
-  
+
   @override
   final Map<String, String> defaultHeaders;
-  
+
   @override
   final List<ApiInterceptor> interceptors;
 
   /// Creates a new [DioAdapter].
+  ///
+  /// If no [client] is provided, a new [dio.Dio] instance is created
+  /// with the given [baseUrl].
   DioAdapter({
     required this.baseUrl,
     dio.Dio? client,
@@ -31,27 +52,27 @@ class DioAdapter implements ApiAdapter {
     }
   }
 
+  /// Provides access to the underlying [dio.Dio] client.
+  ///
+  /// Useful for passing to Retrofit-generated client classes.
+  dio.Dio get client => _client;
+
   @override
   Future<ApiResponse<T>> request<T>(ApiRequest request) async {
-    ApiRequest finalRequest = request.copyWith(
-      headers: {...defaultHeaders, ...request.headers},
-    );
-
     // 1. Run onRequest interceptors
-    for (final interceptor in interceptors) {
-      final dynamic result = await interceptor.onRequest(finalRequest);
-      if (result is ApiResponse) {
-        return result as ApiResponse<T>;
-      } else if (result is ApiRequest) {
-        finalRequest = result;
-      }
+    final dynamic requestResult = await runOnRequest(request);
+    if (requestResult is ApiResponse) {
+      return requestResult as ApiResponse<T>;
     }
+    final ApiRequest finalRequest = requestResult as ApiRequest;
 
     try {
       final dioResponse = await _client.request<dynamic>(
         finalRequest.path,
         data: finalRequest.body,
-        queryParameters: finalRequest.queryParameters,
+        queryParameters: finalRequest.queryParameters.isNotEmpty
+            ? finalRequest.queryParameters
+            : null,
         options: dio.Options(
           method: finalRequest.method.value,
           headers: finalRequest.headers,
@@ -75,13 +96,12 @@ class DioAdapter implements ApiAdapter {
       );
 
       // 2. Run onResponse interceptors
-      for (final interceptor in interceptors) {
-        response = await interceptor.onResponse(response);
-      }
+      response = await runOnResponse(response);
 
       if (!response.isSuccessful) {
         throw ServerException.fromResponse(
-          message: 'Server returned ${response.statusCode}: ${response.statusMessage}',
+          message: 'Server returned ${response.statusCode}: '
+              '${response.statusMessage}',
           request: finalRequest,
           response: response,
         );
@@ -91,95 +111,104 @@ class DioAdapter implements ApiAdapter {
     } on ApiException {
       rethrow;
     } on dio.DioException catch (e, stackTrace) {
-      ApiException apiException;
-      
-      switch (e.type) {
-        case dio.DioExceptionType.connectionTimeout:
-        case dio.DioExceptionType.sendTimeout:
-        case dio.DioExceptionType.receiveTimeout:
-        case dio.DioExceptionType.connectionError:
-          apiException = NetworkException(
-            message: e.message ?? 'Network connection error',
-            request: finalRequest,
-            error: e,
-            stackTrace: stackTrace,
-          );
-          break;
-        case dio.DioExceptionType.badResponse:
-          final respHeaders = <String, List<String>>{};
-          e.response?.headers.map.forEach((key, value) {
-            respHeaders[key] = value;
-          });
-          
-          final apiResp = ApiResponse<dynamic>(
-            data: e.response?.data,
-            statusCode: e.response?.statusCode ?? 500,
-            headers: respHeaders,
-            statusMessage: e.response?.statusMessage,
-          );
-          
-          apiException = ServerException.fromResponse(
-            message: e.message ?? 'Server error',
-            request: finalRequest,
-            response: apiResp,
-            error: e,
-            stackTrace: stackTrace,
-          );
-          break;
-        case dio.DioExceptionType.cancel:
-          apiException = NetworkException(
-            message: 'Request cancelled',
-            request: finalRequest,
-            error: e,
-            stackTrace: stackTrace,
-          );
-          break;
-        case dio.DioExceptionType.badCertificate:
-        case dio.DioExceptionType.unknown:
-        default:
-          apiException = NetworkException(
-            message: e.message ?? 'Unknown network error',
-            request: finalRequest,
-            error: e,
-            stackTrace: stackTrace,
-          );
-          break;
-      }
-
-      // 3. Run onError interceptors
-      for (final interceptor in interceptors) {
-        final dynamic result = await interceptor.onError(apiException, this.request);
-        if (result is ApiResponse) {
-          return result as ApiResponse<T>;
-        } else if (result is ApiException) {
-          apiException = result;
-        }
-      }
-      
-      throw apiException;
+      final apiException = _mapDioException(e, finalRequest, stackTrace);
+      return runOnError<T>(apiException);
     } catch (e, stackTrace) {
-      ApiException apiException = NetworkException(
+      final apiException = NetworkException(
         message: 'Unexpected error occurred.',
         request: finalRequest,
         error: e,
         stackTrace: stackTrace,
       );
-
-      for (final interceptor in interceptors) {
-        final dynamic result = await interceptor.onError(apiException, this.request);
-        if (result is ApiResponse) {
-          return result as ApiResponse<T>;
-        } else if (result is ApiException) {
-          apiException = result;
-        }
-      }
-      
-      throw apiException;
+      return runOnError<T>(apiException);
     }
   }
 
   @override
   void close({bool force = false}) {
     _client.close(force: force);
+  }
+
+  ApiException _mapDioException(
+    dio.DioException e,
+    ApiRequest request,
+    StackTrace stackTrace,
+  ) {
+    switch (e.type) {
+      case dio.DioExceptionType.connectionTimeout:
+        return TimeoutException(
+          message: e.message ?? 'Connection timeout',
+          timeoutType: TimeoutType.connection,
+          request: request,
+          error: e,
+          stackTrace: stackTrace,
+        );
+      case dio.DioExceptionType.sendTimeout:
+        return TimeoutException(
+          message: e.message ?? 'Send timeout',
+          timeoutType: TimeoutType.send,
+          request: request,
+          error: e,
+          stackTrace: stackTrace,
+        );
+      case dio.DioExceptionType.receiveTimeout:
+        return TimeoutException(
+          message: e.message ?? 'Receive timeout',
+          timeoutType: TimeoutType.receive,
+          request: request,
+          error: e,
+          stackTrace: stackTrace,
+        );
+      case dio.DioExceptionType.connectionError:
+        return NetworkException(
+          message: e.message ?? 'Connection error',
+          request: request,
+          error: e,
+          stackTrace: stackTrace,
+        );
+      case dio.DioExceptionType.badResponse:
+        final respHeaders = <String, List<String>>{};
+        e.response?.headers.map.forEach((key, value) {
+          respHeaders[key] = value;
+        });
+
+        final apiResp = ApiResponse<dynamic>(
+          data: e.response?.data,
+          statusCode: e.response?.statusCode ?? 500,
+          headers: respHeaders,
+          statusMessage: e.response?.statusMessage,
+          request: request,
+        );
+
+        return ServerException.fromResponse(
+          message: e.message ?? 'Server error',
+          request: request,
+          response: apiResp,
+          error: e,
+          stackTrace: stackTrace,
+        );
+      case dio.DioExceptionType.cancel:
+        return CancellationException(
+          message: 'Request cancelled',
+          request: request,
+          error: e,
+          stackTrace: stackTrace,
+        );
+      case dio.DioExceptionType.badCertificate:
+        return NetworkException(
+          message: e.message ?? 'Bad certificate',
+          request: request,
+          error: e,
+          stackTrace: stackTrace,
+        );
+      case dio.DioExceptionType.unknown:
+      case dio.DioExceptionType.transformTimeout:
+        return NetworkException(
+          message: e.message ?? 'Unknown network error',
+          request: request,
+          error: e,
+          stackTrace: stackTrace,
+        );
+    }
   }
 }

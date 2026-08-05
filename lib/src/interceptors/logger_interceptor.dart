@@ -6,15 +6,32 @@ import '../exceptions/api_exception.dart';
 import '../interfaces/api_interceptor.dart';
 
 /// An interceptor that logs API requests, responses, and errors.
+///
+/// Supports multiple output formats (pretty, compact, JSON),
+/// sensitive data masking, curl command generation, execution
+/// time tracking, and custom log printers.
+///
+/// {@tool snippet}
+/// ```dart
+/// final logger = LoggerInterceptor(
+///   config: const LoggerConfig(
+///     level: LogLevel.verbose,
+///     format: LogFormat.pretty,
+///     colors: true,
+///   ),
+/// );
+/// ```
+/// {@end-tool}
 class LoggerInterceptor implements ApiInterceptor {
+  /// The logger configuration.
   final LoggerConfig config;
 
   /// Creates a [LoggerInterceptor] with the given [config].
   LoggerInterceptor({this.config = const LoggerConfig()});
 
   void _log(String message) {
-    if (config.output != null) {
-      config.output!(message);
+    if (config.printer != null) {
+      config.printer!.log(message);
     } else {
       // ignore: avoid_print
       print(message);
@@ -25,17 +42,23 @@ class LoggerInterceptor implements ApiInterceptor {
   Future<dynamic> onRequest(ApiRequest request) async {
     if (!config.isEnabled(LogLevel.info)) return request;
 
+    // Check request filter
+    if (config.requestFilter != null && !config.requestFilter!(request)) {
+      return request;
+    }
+
     // Attach start time for execution time tracking
     final newExtra = Map<String, dynamic>.from(request.extra);
-    newExtra['requestStartTime'] = DateTime.now().millisecondsSinceEpoch;
+    newExtra['_requestStartTime'] = DateTime.now().millisecondsSinceEpoch;
     final finalRequest = request.copyWith(extra: newExtra);
 
-    if (config.format == LogFormat.json) {
-      _logJsonRequest(finalRequest);
-    } else if (config.format == LogFormat.pretty) {
-      _logPrettyRequest(finalRequest);
-    } else {
-      _logCompactRequest(finalRequest);
+    switch (config.format) {
+      case LogFormat.json:
+        _logJsonRequest(finalRequest);
+      case LogFormat.pretty:
+        _logPrettyRequest(finalRequest);
+      case LogFormat.compact:
+        _logCompactRequest(finalRequest);
     }
 
     if (config.printCurl) {
@@ -46,19 +69,33 @@ class LoggerInterceptor implements ApiInterceptor {
   }
 
   @override
-  Future<ApiResponse<dynamic>> onResponse(ApiResponse<dynamic> response) async {
+  Future<ApiResponse<dynamic>> onResponse(
+    ApiResponse<dynamic> response,
+  ) async {
     if (!config.isEnabled(LogLevel.info)) return response;
 
-    // request is available via response.request
-    // For simplicity, we just log the response.
-    // For simplicity, we just log the response.
-    
-    if (config.format == LogFormat.json) {
-      _logJsonResponse(response);
-    } else if (config.format == LogFormat.pretty) {
-      _logPrettyResponse(response);
-    } else {
-      _logCompactResponse(response);
+    // Check status code filter
+    if (config.filterStatusCodes != null &&
+        !config.filterStatusCodes!.contains(response.statusCode)) {
+      return response;
+    }
+
+    // Check request filter
+    if (config.requestFilter != null &&
+        response.request != null &&
+        !config.requestFilter!(response.request!)) {
+      return response;
+    }
+
+    final executionTime = _getExecutionTime(response.request);
+
+    switch (config.format) {
+      case LogFormat.json:
+        _logJsonResponse(response, executionTime);
+      case LogFormat.pretty:
+        _logPrettyResponse(response, executionTime);
+      case LogFormat.compact:
+        _logCompactResponse(response, executionTime);
     }
 
     return response;
@@ -71,18 +108,47 @@ class LoggerInterceptor implements ApiInterceptor {
   ) async {
     if (!config.isEnabled(LogLevel.error)) return error;
 
-    if (config.format == LogFormat.json) {
-      _logJsonError(error);
-    } else {
-      final color = config.colors ? '\x1B[31m' : '';
-      final reset = config.colors ? '\x1B[0m' : '';
-      _log('$color[ERROR] ${error.message}$reset');
-      if (error.response != null) {
-        _logPrettyResponse(error.response!);
-      }
+    final executionTime = _getExecutionTime(error.request);
+
+    switch (config.format) {
+      case LogFormat.json:
+        _logJsonError(error, executionTime);
+      case LogFormat.pretty:
+      case LogFormat.compact:
+        final color = config.colors ? '\x1B[31m' : '';
+        final reset = config.colors ? '\x1B[0m' : '';
+        final buffer = StringBuffer();
+        buffer.writeln(
+            '$color┌── Error ────────────────────────────────────────────────────$reset');
+        buffer.writeln('$color│ ${reset}ERROR: ${error.message}');
+        if (error.request != null) {
+          buffer.writeln(
+              '$color│ ${reset}Request: ${error.request!.method.value} ${error.request!.path}');
+        }
+        if (error.response != null) {
+          buffer
+              .writeln('$color│ ${reset}Status: ${error.response!.statusCode}');
+        }
+        if (executionTime != null && config.printExecutionTime) {
+          buffer.writeln('$color│ ${reset}Duration: ${executionTime}ms');
+        }
+        buffer.write(
+            '$color└────────────────────────────────────────────────────────────$reset');
+        _log(buffer.toString());
     }
 
-    return error; // Let it propagate
+    return error;
+  }
+
+  // ─── Utility Methods ─────────────────────────────────────────────
+
+  Duration? _getExecutionTime(ApiRequest? request) {
+    if (request == null || !config.printExecutionTime) return null;
+    final startTime = request.extra['_requestStartTime'] as int?;
+    if (startTime == null) return null;
+    return Duration(
+      milliseconds: DateTime.now().millisecondsSinceEpoch - startTime,
+    );
   }
 
   String _maskValue(String key, String value) {
@@ -96,49 +162,58 @@ class LoggerInterceptor implements ApiInterceptor {
     return headers.map((key, value) => MapEntry(key, _maskValue(key, value)));
   }
 
-  // --- Json Formatting ---
+  // ─── JSON Formatting ─────────────────────────────────────────────
 
   void _logJsonRequest(ApiRequest request) {
-    final logData = {
+    final logData = <String, dynamic>{
       'type': 'request',
       'method': request.method.value,
       'url': request.path,
       if (config.printRequestHeaders) 'headers': _maskHeaders(request.headers),
-      if (config.printRequestBody) 'body': request.body,
+      if (config.printRequestBody && request.body != null) 'body': request.body,
     };
     _log(jsonEncode(logData));
   }
 
-  void _logJsonResponse(ApiResponse<dynamic> response) {
-    final logData = {
+  void _logJsonResponse(
+    ApiResponse<dynamic> response,
+    Duration? executionTime,
+  ) {
+    final logData = <String, dynamic>{
       'type': 'response',
       'statusCode': response.statusCode,
       if (config.printResponseHeaders) 'headers': response.headers,
-      if (config.printResponseBody) 'body': response.data,
+      if (config.printResponseBody && response.data != null)
+        'body': response.data,
+      if (executionTime != null && config.printExecutionTime)
+        'durationMs': executionTime.inMilliseconds,
     };
     _log(jsonEncode(logData));
   }
 
-  void _logJsonError(ApiException error) {
-    final logData = {
+  void _logJsonError(ApiException error, Duration? executionTime) {
+    final logData = <String, dynamic>{
       'type': 'error',
       'message': error.message,
       'statusCode': error.response?.statusCode,
       'url': error.request?.path,
+      if (executionTime != null && config.printExecutionTime)
+        'durationMs': executionTime.inMilliseconds,
     };
     _log(jsonEncode(logData));
   }
 
-  // --- Pretty Formatting ---
+  // ─── Pretty Formatting ───────────────────────────────────────────
 
   void _logPrettyRequest(ApiRequest request) {
     final color = config.colors ? '\x1B[34m' : ''; // Blue
     final reset = config.colors ? '\x1B[0m' : '';
-    
+
     final buffer = StringBuffer();
-    buffer.writeln('$color┌── Request ──────────────────────────────────────────────────$reset');
+    buffer.writeln(
+        '$color┌── Request ──────────────────────────────────────────────────$reset');
     buffer.writeln('$color│ $reset${request.method.value} ${request.path}');
-    
+
     if (config.printRequestHeaders && request.headers.isNotEmpty) {
       buffer.writeln('$color├─ Headers:$reset');
       _maskHeaders(request.headers).forEach((key, value) {
@@ -148,21 +223,37 @@ class LoggerInterceptor implements ApiInterceptor {
 
     if (config.printRequestBody && request.body != null) {
       buffer.writeln('$color├─ Body:$reset');
-      buffer.writeln('$color│ $reset  ${_tryFormatJson(request.body)}');
+      final bodyLines = _tryFormatJson(request.body).split('\n');
+      for (final line in bodyLines) {
+        buffer.writeln('$color│ $reset  $line');
+      }
     }
-    buffer.writeln('$color└────────────────────────────────────────────────────────────$reset');
+    buffer.write(
+        '$color└────────────────────────────────────────────────────────────$reset');
     _log(buffer.toString());
   }
 
-  void _logPrettyResponse(ApiResponse<dynamic> response) {
+  void _logPrettyResponse(
+    ApiResponse<dynamic> response,
+    Duration? executionTime,
+  ) {
     final isSuccess = response.statusCode >= 200 && response.statusCode < 300;
-    final color = config.colors ? (isSuccess ? '\x1B[32m' : '\x1B[33m') : ''; // Green or Yellow
+    final color = config.colors
+        ? (isSuccess ? '\x1B[32m' : '\x1B[33m')
+        : ''; // Green or Yellow
     final reset = config.colors ? '\x1B[0m' : '';
 
     final buffer = StringBuffer();
-    buffer.writeln('$color┌── Response ─────────────────────────────────────────────────$reset');
-    buffer.writeln('$color│ ${reset}Status: ${response.statusCode} ${response.statusMessage ?? ''}');
-    
+    buffer.writeln(
+        '$color┌── Response ─────────────────────────────────────────────────$reset');
+    buffer.writeln(
+        '$color│ ${reset}Status: ${response.statusCode} ${response.statusMessage ?? ''}');
+
+    if (executionTime != null && config.printExecutionTime) {
+      buffer.writeln(
+          '$color│ ${reset}Duration: ${executionTime.inMilliseconds}ms');
+    }
+
     if (config.printResponseHeaders && response.headers.isNotEmpty) {
       buffer.writeln('$color├─ Headers:$reset');
       response.headers.forEach((key, value) {
@@ -172,38 +263,50 @@ class LoggerInterceptor implements ApiInterceptor {
 
     if (config.printResponseBody && response.data != null) {
       buffer.writeln('$color├─ Body:$reset');
-      buffer.writeln('$color│ $reset  ${_tryFormatJson(response.data)}');
+      final bodyLines = _tryFormatJson(response.data).split('\n');
+      for (final line in bodyLines) {
+        buffer.writeln('$color│ $reset  $line');
+      }
     }
-    buffer.writeln('$color└────────────────────────────────────────────────────────────$reset');
+    buffer.write(
+        '$color└────────────────────────────────────────────────────────────$reset');
     _log(buffer.toString());
   }
 
-  // --- Compact Formatting ---
+  // ─── Compact Formatting ──────────────────────────────────────────
 
   void _logCompactRequest(ApiRequest request) {
-    _log('REQ: ${request.method.value} ${request.path}');
+    _log('→ ${request.method.value} ${request.path}');
   }
 
-  void _logCompactResponse(ApiResponse<dynamic> response) {
-    _log('RES: [${response.statusCode}]');
+  void _logCompactResponse(
+    ApiResponse<dynamic> response,
+    Duration? executionTime,
+  ) {
+    final timeStr = (executionTime != null && config.printExecutionTime)
+        ? ' (${executionTime.inMilliseconds}ms)'
+        : '';
+    _log('← [${response.statusCode}]$timeStr');
   }
 
-  // --- Utilities ---
+  // ─── Curl Generation ─────────────────────────────────────────────
 
   void _logCurlCommand(ApiRequest request) {
     final curl = StringBuffer('curl -X ${request.method.value}');
-    
+
     _maskHeaders(request.headers).forEach((key, value) {
       curl.write(' -H "$key: $value"');
     });
 
     if (request.body != null) {
-      final bodyStr = request.body is String ? request.body : jsonEncode(request.body);
-      curl.write(" -d '${bodyStr.replaceAll("'", "'\\''")}'");
+      final bodyStr = request.body is String
+          ? request.body as String
+          : jsonEncode(request.body);
+      curl.write(" -d '${bodyStr.replaceAll("'", "'\\''")}' ");
     }
 
     curl.write(' "${request.path}"');
-    
+
     final color = config.colors ? '\x1B[36m' : ''; // Cyan
     final reset = config.colors ? '\x1B[0m' : '';
     _log('$color$curl$reset');

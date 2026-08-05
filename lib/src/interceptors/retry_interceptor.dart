@@ -4,10 +4,34 @@ import '../core/api_request.dart';
 import '../core/api_response.dart';
 import '../exceptions/api_exception.dart';
 import '../interfaces/api_interceptor.dart';
+import '../models/retry_metrics.dart';
+import '../utils/http_date_parser.dart';
 
 /// An interceptor that retries failed requests based on a [RetryConfig].
+///
+/// Supports multiple backoff strategies, custom retry conditions,
+/// connectivity-aware retries, Retry-After header support, and
+/// retry metrics collection.
+///
+/// {@tool snippet}
+/// ```dart
+/// final retry = RetryInterceptor(
+///   config: const RetryConfig(
+///     maxRetries: 3,
+///     backoffStrategy: RetryBackoffStrategy.exponential,
+///     addJitter: true,
+///   ),
+/// );
+/// ```
+/// {@end-tool}
 class RetryInterceptor implements ApiInterceptor {
+  /// The retry configuration.
   final RetryConfig config;
+
+  /// Retry metrics for monitoring.
+  ///
+  /// Only populated when [RetryConfig.enableMetrics] is `true`.
+  final RetryMetrics metrics = RetryMetrics();
 
   /// Creates a [RetryInterceptor] with the given [config].
   RetryInterceptor({this.config = const RetryConfig()});
@@ -15,20 +39,19 @@ class RetryInterceptor implements ApiInterceptor {
   @override
   Future<dynamic> onRequest(ApiRequest request) async {
     // Initialize retry state if not present
-    if (!request.extra.containsKey('retryCount')) {
+    if (!request.extra.containsKey('_retryCount')) {
       final newExtra = Map<String, dynamic>.from(request.extra);
-      newExtra['retryCount'] = 0;
-      newExtra['firstAttemptTime'] = DateTime.now();
+      newExtra['_retryCount'] = 0;
+      newExtra['_firstAttemptTime'] = DateTime.now().millisecondsSinceEpoch;
       return request.copyWith(extra: newExtra);
     }
     return request;
   }
 
   @override
-  Future<ApiResponse<dynamic>> onResponse(ApiResponse<dynamic> response) async {
-    // Check if status code requires retry (e.g. 503) and wasn't thrown as exception yet
-    // Typically adapters throw ServerException for bad status codes before onResponse interceptors,
-    // but if it wasn't thrown, we don't intercept it here since onResponse doesn't have an invoker.
+  Future<ApiResponse<dynamic>> onResponse(
+    ApiResponse<dynamic> response,
+  ) async {
     return response;
   }
 
@@ -42,25 +65,44 @@ class RetryInterceptor implements ApiInterceptor {
       return error;
     }
 
-    final int currentAttempt = request.extra['retryCount'] as int? ?? 0;
-    final DateTime? firstAttemptTime = request.extra['firstAttemptTime'] as DateTime?;
+    final int currentAttempt = request.extra['_retryCount'] as int? ?? 0;
+    final int? firstAttemptMs = request.extra['_firstAttemptTime'] as int?;
+    final DateTime? firstAttemptTime = firstAttemptMs != null
+        ? DateTime.fromMillisecondsSinceEpoch(firstAttemptMs)
+        : null;
 
-    if (!_shouldRetry(error, currentAttempt, firstAttemptTime)) {
-      return error; // Let the error propagate
+    if (!_shouldRetry(error, currentAttempt, firstAttemptTime, request)) {
+      if (config.enableMetrics && currentAttempt > 0) {
+        metrics.recordFailure();
+      }
+      return error;
     }
 
-    // Determine delay
+    // Check connectivity before retrying
+    if (config.connectivityChecker != null) {
+      final isConnected = await config.connectivityChecker!.isConnected;
+      if (!isConnected) {
+        return error;
+      }
+    }
+
+    // Calculate delay
     Duration delay = config.calculateDelay(currentAttempt + 1);
 
     // Check for Retry-After header
     if (config.respectRetryAfter && error.response != null) {
-      final retryAfter = error.response!.headers['retry-after']?.first;
-      if (retryAfter != null) {
-        final parsedDelay = _parseRetryAfter(retryAfter);
+      final retryAfterValues = error.response!.headers['retry-after'];
+      if (retryAfterValues != null && retryAfterValues.isNotEmpty) {
+        final parsedDelay = _parseRetryAfter(retryAfterValues.first);
         if (parsedDelay != null && parsedDelay > delay) {
           delay = parsedDelay;
         }
       }
+    }
+
+    // Record metrics
+    if (config.enableMetrics) {
+      metrics.recordRetry(delay);
     }
 
     // Wait for the delay
@@ -73,18 +115,19 @@ class RetryInterceptor implements ApiInterceptor {
 
     // Update request state
     final newExtra = Map<String, dynamic>.from(request.extra);
-    newExtra['retryCount'] = currentAttempt + 1;
+    newExtra['_retryCount'] = currentAttempt + 1;
     final newRequest = request.copyWith(extra: newExtra);
 
     // Retry the request via the invoker
     try {
       final response = await invoker(newRequest);
-      return response; // Recovered
+      if (config.enableMetrics) {
+        metrics.recordSuccess();
+      }
+      return response;
     } on ApiException catch (e) {
-      // Re-evaluate in the next catch block by propagating
-      return e; 
+      return e;
     } catch (e) {
-      // Wrap unexpected errors
       return NetworkException(
         message: 'Unexpected error during retry: $e',
         request: newRequest,
@@ -93,11 +136,22 @@ class RetryInterceptor implements ApiInterceptor {
     }
   }
 
-  bool _shouldRetry(ApiException error, int attempt, DateTime? firstAttemptTime) {
+  bool _shouldRetry(
+    ApiException error,
+    int attempt,
+    DateTime? firstAttemptTime,
+    ApiRequest request,
+  ) {
+    // Check custom strategy first
+    if (config.customStrategy != null) {
+      return config.customStrategy!.shouldRetry(error, attempt + 1, request);
+    }
+
     if (attempt >= config.maxRetries) {
       return false;
     }
 
+    // Check max elapsed duration
     if (config.maxElapsedDuration != null && firstAttemptTime != null) {
       final elapsed = DateTime.now().difference(firstAttemptTime);
       if (elapsed > config.maxElapsedDuration!) {
@@ -105,23 +159,25 @@ class RetryInterceptor implements ApiInterceptor {
       }
     }
 
-    final request = error.request;
-    if (request == null || !config.retryableMethods.contains(request.method)) {
+    // Check if method is retryable
+    if (!config.retryableMethods.contains(request.method)) {
       return false;
     }
 
+    // Check custom exception evaluator
     if (config.shouldRetryException != null) {
       return config.shouldRetryException!(error);
     }
 
+    // Check retryable status codes
     if (error is ServerException && error.response != null) {
       if (config.retryableStatusCodes.contains(error.response!.statusCode)) {
         return true;
       }
     }
 
+    // Network exceptions are typically retryable
     if (error is NetworkException) {
-      // Network exceptions (timeouts, connection issues) are typically retryable
       return true;
     }
 
@@ -129,18 +185,19 @@ class RetryInterceptor implements ApiInterceptor {
   }
 
   Duration? _parseRetryAfter(String retryAfter) {
-    // Retry-After can be a delay in seconds or an HTTP-date
+    // Try parsing as seconds first
     final seconds = int.tryParse(retryAfter);
     if (seconds != null) {
       return Duration(seconds: seconds);
     }
-    try {
-      final date = DateTime.parse(retryAfter); // HTTP-date parsing is complex, this is simplified
+
+    // Try parsing as HTTP-date
+    final date = HttpDateParser.parse(retryAfter);
+    if (date != null) {
       final diff = date.difference(DateTime.now());
-      if (diff.isNegative) return Duration.zero;
-      return diff;
-    } catch (_) {
-      return null;
+      return diff.isNegative ? Duration.zero : diff;
     }
+
+    return null;
   }
 }

@@ -1,4 +1,4 @@
-include: package:flutter_lints/flutter.yaml
+include: package:lints/recommended.yaml
 
 analyzer:
   language:
@@ -8,7 +8,6 @@ analyzer:
   errors:
     missing_required_param: error
     missing_return: error
-    todo: warning
 
 linter:
   rules:
@@ -31,8 +30,6 @@ linter:
     - empty_catches
     - file_names
     - hash_and_equals
-    - iterable_contains_unrelated_type
-    - list_remove_unrelated_type
     - no_duplicate_case_values
     - non_constant_identifier_names
     - package_api_docs
@@ -40,9 +37,9 @@ linter:
     - prefer_generic_function_type_aliases
     - prefer_is_empty
     - prefer_is_not_empty
-    - prefer_iterable_whereType
     - prefer_typing_uninitialized_variables
     - provide_deprecation_message
     - unawaited_futures
     - unrelated_type_equality_checks
     - valid_regexps
+    - public_member_api_docs

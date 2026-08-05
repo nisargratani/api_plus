@@ -1,30 +1,47 @@
 /// Represents the HTTP methods supported by the API clients.
+///
+/// Each method has a [value] property containing the uppercase string
+/// representation as used in HTTP protocol (e.g., `'GET'`, `'POST'`).
+///
+/// {@tool snippet}
+/// ```dart
+/// const method = HttpMethod.get;
+/// print(method.value); // 'GET'
+/// print(method.isIdempotent); // true
+/// ```
+/// {@end-tool}
 enum HttpMethod {
-  /// GET method
+  /// HTTP GET method — retrieves a resource.
   get('GET'),
 
-  /// POST method
+  /// HTTP POST method — creates a resource.
   post('POST'),
 
-  /// PUT method
+  /// HTTP PUT method — replaces a resource.
   put('PUT'),
 
-  /// DELETE method
+  /// HTTP DELETE method — deletes a resource.
   delete('DELETE'),
 
-  /// PATCH method
+  /// HTTP PATCH method — partially updates a resource.
   patch('PATCH'),
 
-  /// HEAD method
+  /// HTTP HEAD method — retrieves headers only.
   head('HEAD'),
 
-  /// OPTIONS method
+  /// HTTP OPTIONS method — describes communication options.
   options('OPTIONS');
 
-  /// The string representation of the HTTP method.
+  /// The uppercase string representation of this HTTP method.
   final String value;
 
   const HttpMethod(this.value);
+
+  /// Returns `true` if this method is idempotent.
+  ///
+  /// Idempotent methods can be safely retried without side effects.
+  /// GET, HEAD, PUT, DELETE, and OPTIONS are idempotent.
+  bool get isIdempotent => this != post && this != patch;
 
   @override
   String toString() => value;
