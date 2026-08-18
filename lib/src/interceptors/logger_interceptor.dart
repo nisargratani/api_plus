@@ -33,8 +33,20 @@ class LoggerInterceptor implements ApiInterceptor {
     if (config.printer != null) {
       config.printer!.log(message);
     } else {
-      // ignore: avoid_print
-      print(message);
+      // Split by newline and chunk to avoid truncation in consoles
+      final lines = message.split('\n');
+      for (final line in lines) {
+        if (line.length > 800) {
+          for (var i = 0; i < line.length; i += 800) {
+            final end = (i + 800 < line.length) ? i + 800 : line.length;
+            // ignore: avoid_print
+            print(line.substring(i, end));
+          }
+        } else {
+          // ignore: avoid_print
+          print(line);
+        }
+      }
     }
   }
 
