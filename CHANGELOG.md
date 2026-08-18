@@ -1,3 +1,9 @@
+## 0.0.2
+
+- Fix log truncation for long console messages by chunking output
+- Update dependencies (`dio`, `http`)
+- Update dev dependencies (`lints`, `test`, `mocktail`, `fake_async`)
+
 ## 0.0.1
 
 - Initial release
