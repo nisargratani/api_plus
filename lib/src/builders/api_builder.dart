@@ -3,6 +3,7 @@ import '../adapters/http/http_adapter.dart';
 import '../config/cache_config.dart';
 import '../config/logger_config.dart';
 import '../config/retry_config.dart';
+import '../core/api_request.dart';
 import '../interfaces/api_adapter.dart';
 import '../interfaces/api_interceptor.dart';
 import '../interceptors/cache_interceptor.dart';
@@ -113,19 +114,25 @@ class ApiBuilder {
     return this;
   }
 
-  /// Sets the default connection timeout.
+  /// Sets the default connection timeout of the built adapter.
+  ///
+  /// [ApiRequest.connectTimeout] overrides it for a single request.
   ApiBuilder withConnectTimeout(Duration timeout) {
     _connectTimeout = timeout;
     return this;
   }
 
-  /// Sets the default receive timeout.
+  /// Sets the default receive timeout of the built adapter.
+  ///
+  /// [ApiRequest.receiveTimeout] overrides it for a single request.
   ApiBuilder withReceiveTimeout(Duration timeout) {
     _receiveTimeout = timeout;
     return this;
   }
 
-  /// Sets the default send timeout.
+  /// Sets the default send timeout of the built adapter.
+  ///
+  /// [ApiRequest.sendTimeout] overrides it for a single request.
   ApiBuilder withSendTimeout(Duration timeout) {
     _sendTimeout = timeout;
     return this;
@@ -172,12 +179,18 @@ class ApiBuilder {
           baseUrl: _baseUrl,
           defaultHeaders: headers,
           interceptors: interceptors,
+          connectTimeout: _connectTimeout,
+          receiveTimeout: _receiveTimeout,
+          sendTimeout: _sendTimeout,
         );
       case ApiClientType.dio:
         return DioAdapter(
           baseUrl: _baseUrl,
           defaultHeaders: headers,
           interceptors: interceptors,
+          connectTimeout: _connectTimeout,
+          receiveTimeout: _receiveTimeout,
+          sendTimeout: _sendTimeout,
         );
     }
   }

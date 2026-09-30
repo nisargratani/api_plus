@@ -1,5 +1,6 @@
 import 'package:meta/meta.dart';
 import '../models/http_method.dart';
+import 'api_cancel_token.dart';
 
 /// Represents a unified API request to be handled by any underlying adapter.
 ///
@@ -36,6 +37,9 @@ class ApiRequest {
   final Map<String, String> headers;
 
   /// The query parameters to append to the URL.
+  ///
+  /// They are merged with any query string already present in [path].
+  /// `null` values are omitted; [Iterable] values produce repeated keys.
   final Map<String, dynamic> queryParameters;
 
   /// The body payload, if any.
@@ -65,6 +69,13 @@ class ApiRequest {
   /// request start time). Can also be used by custom interceptors.
   final Map<String, dynamic> extra;
 
+  /// Optional token for cancelling this request.
+  ///
+  /// When the token is cancelled, the request is aborted (including any
+  /// pending retry delay) and throws a `CancellationException`. The token
+  /// is not part of [==] or [hashCode].
+  final ApiCancelToken? cancelToken;
+
   /// Creates a new [ApiRequest].
   ///
   /// The [path] is required. All other parameters have sensible defaults.
@@ -87,6 +98,7 @@ class ApiRequest {
     this.receiveTimeout,
     this.sendTimeout,
     this.extra = const {},
+    this.cancelToken,
   });
 
   /// Creates a copy of this request with the given fields replaced.
@@ -102,6 +114,7 @@ class ApiRequest {
     Duration? receiveTimeout,
     Duration? sendTimeout,
     Map<String, dynamic>? extra,
+    ApiCancelToken? cancelToken,
   }) {
     return ApiRequest(
       path: path ?? this.path,
@@ -113,6 +126,7 @@ class ApiRequest {
       receiveTimeout: receiveTimeout ?? this.receiveTimeout,
       sendTimeout: sendTimeout ?? this.sendTimeout,
       extra: extra ?? this.extra,
+      cancelToken: cancelToken ?? this.cancelToken,
     );
   }
 
@@ -134,7 +148,10 @@ class ApiRequest {
   int get hashCode => Object.hash(
         path,
         method,
-        Object.hashAll(headers.entries),
+        // Order-independent, consistent with the map comparison in ==.
+        Object.hashAllUnordered(
+          headers.entries.map((e) => Object.hash(e.key, e.value)),
+        ),
         body,
         connectTimeout,
         receiveTimeout,

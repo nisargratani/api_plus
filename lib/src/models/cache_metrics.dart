@@ -1,3 +1,6 @@
+import '../cache/memory_cache_store.dart';
+import '../interfaces/cache_store.dart';
+
 /// Tracks cache performance metrics for monitoring and tuning.
 ///
 /// Provides insight into cache hit/miss rates, eviction counts,
@@ -23,9 +26,15 @@ class CacheMetrics {
   int get misses => _misses;
 
   /// Number of cache evictions due to size limits or invalidation.
+  ///
+  /// Evictions by [MemoryCacheStore] (least-recently-used entries dropped
+  /// because the store is full) are recorded automatically. For a custom
+  /// [CacheStore], call [recordEviction] yourself.
   int get evictions => _evictions;
 
   /// Number of stale cache entries served during network failures.
+  ///
+  /// Entries served by stale-while-revalidate count as [hits].
   int get staleHits => _staleHits;
 
   /// Total number of requests processed by the cache interceptor.

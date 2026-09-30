@@ -53,5 +53,14 @@ void main() async {
   print('Dio client ready: ${adapter.client.options.baseUrl}');
   print('Pass adapter.client to your Retrofit-generated class.');
 
+  // Any request made with the client runs the api_plus interceptors,
+  // exactly as generated Retrofit code would.
+  final response = await adapter.client.get<dynamic>('/posts/1');
+  print('GET /posts/1 -> ${response.statusCode}');
+
+  // The second request is served from the api_plus cache.
+  final cached = await adapter.client.get<dynamic>('/posts/1');
+  print('GET /posts/1 (cached) -> ${cached.statusCode}');
+
   adapter.close();
 }

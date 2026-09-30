@@ -17,10 +17,20 @@ import '../interfaces/cache_store.dart';
 /// {@end-tool}
 class MemoryCacheStore implements CacheStore {
   /// The maximum number of entries to store before evicting.
+  ///
+  /// A value of `0` or less disables storage (every entry is evicted
+  /// immediately).
   final int maxEntries;
 
   final LinkedHashMap<String, CacheEntry> _cache =
       LinkedHashMap<String, CacheEntry>();
+
+  int _evictionCount = 0;
+
+  /// Total number of entries evicted because the store was full.
+  ///
+  /// `CacheInterceptor` reports these in `CacheMetrics.evictions`.
+  int get evictionCount => _evictionCount;
 
   /// Creates a [MemoryCacheStore] with a maximum number of [maxEntries].
   MemoryCacheStore({this.maxEntries = 100});
@@ -45,8 +55,9 @@ class MemoryCacheStore implements CacheStore {
     _cache[key] = entry;
 
     // Evict oldest entries if over capacity
-    while (_cache.length > maxEntries) {
+    while (_cache.length > maxEntries && _cache.isNotEmpty) {
       _cache.remove(_cache.keys.first);
+      _evictionCount++;
     }
   }
 

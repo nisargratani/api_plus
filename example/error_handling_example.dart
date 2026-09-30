@@ -21,6 +21,19 @@ void main() async {
   await _demonstrateErrorHandling(api, '/posts/1', 'Success case');
   await _demonstrateErrorHandling(api, '/posts/999999', 'Not found case');
 
+  // ─── Cancellation ─────────────────────────────────────────────────
+  print('\n=== Cancellation ===');
+  final cancelToken = ApiCancelToken();
+  final pending = api.request<Map<String, dynamic>>(
+    ApiRequest(path: '/posts', cancelToken: cancelToken),
+  );
+  cancelToken.cancel('No longer needed');
+  try {
+    await pending;
+  } on CancellationException catch (e) {
+    print('  ❌ ${e.message}');
+  }
+
   // ─── Error Types Reference ────────────────────────────────────────
   print('\n=== Error Types Hierarchy ===');
   print('''

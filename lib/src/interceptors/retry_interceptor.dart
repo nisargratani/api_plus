@@ -1,7 +1,9 @@
 import 'dart:async';
 import '../config/retry_config.dart';
+import '../core/api_cancel_token.dart';
 import '../core/api_request.dart';
 import '../core/api_response.dart';
+import '../core/internal_keys.dart';
 import '../exceptions/api_exception.dart';
 import '../interfaces/api_interceptor.dart';
 import '../models/retry_metrics.dart';
@@ -55,6 +57,13 @@ class RetryInterceptor implements ApiInterceptor {
     return response;
   }
 
+  /// Retries the failed request until it succeeds, retries are exhausted,
+  /// or the error is not retryable.
+  ///
+  /// Each retry is sent through [invoker], i.e. through the adapter's
+  /// complete interceptor pipeline, so other interceptors (logging, caching)
+  /// observe every attempt. Returns the successful [ApiResponse], or the
+  /// [ApiException] of the last attempt.
   @override
   Future<dynamic> onError(
     ApiException error,
@@ -64,76 +73,104 @@ class RetryInterceptor implements ApiInterceptor {
     if (request == null) {
       return error;
     }
+    // This attempt was sent by a retry loop that is already running further
+    // up the call stack; that loop decides whether to try again.
+    if (request.extra[retryAttemptExtraKey] == true) {
+      return error;
+    }
+    // Cancelled requests are never retried.
+    final cancelToken = request.cancelToken;
+    if (error is CancellationException || (cancelToken?.isCancelled ?? false)) {
+      return error;
+    }
 
-    final int currentAttempt = request.extra['_retryCount'] as int? ?? 0;
+    var attempt = request.extra['_retryCount'] as int? ?? 0;
     final int? firstAttemptMs = request.extra['_firstAttemptTime'] as int?;
     final DateTime? firstAttemptTime = firstAttemptMs != null
         ? DateTime.fromMillisecondsSinceEpoch(firstAttemptMs)
         : null;
 
-    if (!_shouldRetry(error, currentAttempt, firstAttemptTime, request)) {
-      if (config.enableMetrics && currentAttempt > 0) {
-        metrics.recordFailure();
+    ApiException lastError = error;
+    var retried = false;
+
+    while (_shouldRetry(lastError, attempt, firstAttemptTime, request)) {
+      // Check connectivity before retrying
+      if (config.connectivityChecker != null &&
+          !await config.connectivityChecker!.isConnected) {
+        break;
       }
-      return error;
-    }
 
-    // Check connectivity before retrying
-    if (config.connectivityChecker != null) {
-      final isConnected = await config.connectivityChecker!.isConnected;
-      if (!isConnected) {
-        return error;
+      final delay = _delayFor(lastError, attempt + 1);
+      config.onRetry?.call(attempt + 1, delay);
+      if (!await _wait(delay, cancelToken)) {
+        // Cancelled while waiting: the retry never happened.
+        return cancellationFor(request);
       }
-    }
-
-    // Calculate delay
-    Duration delay = config.calculateDelay(currentAttempt + 1);
-
-    // Check for Retry-After header
-    if (config.respectRetryAfter && error.response != null) {
-      final retryAfterValues = error.response!.headers['retry-after'];
-      if (retryAfterValues != null && retryAfterValues.isNotEmpty) {
-        final parsedDelay = _parseRetryAfter(retryAfterValues.first);
-        if (parsedDelay != null && parsedDelay > delay) {
-          delay = parsedDelay;
-        }
-      }
-    }
-
-    // Record metrics
-    if (config.enableMetrics) {
-      metrics.recordRetry(delay);
-    }
-
-    // Wait for the delay
-    if (delay > Duration.zero) {
-      await Future<void>.delayed(delay);
-    }
-
-    // Trigger onRetry callback
-    config.onRetry?.call(currentAttempt + 1, delay);
-
-    // Update request state
-    final newExtra = Map<String, dynamic>.from(request.extra);
-    newExtra['_retryCount'] = currentAttempt + 1;
-    final newRequest = request.copyWith(extra: newExtra);
-
-    // Retry the request via the invoker
-    try {
-      final response = await invoker(newRequest);
       if (config.enableMetrics) {
-        metrics.recordSuccess();
+        metrics.recordRetry(delay);
       }
-      return response;
-    } on ApiException catch (e) {
-      return e;
-    } catch (e) {
-      return NetworkException(
-        message: 'Unexpected error during retry: $e',
-        request: newRequest,
-        error: e,
-      );
+
+      attempt++;
+      retried = true;
+      final newRequest = withExtras(request, {
+        '_retryCount': attempt,
+        retryAttemptExtraKey: true,
+      });
+
+      try {
+        final response = await invoker(newRequest);
+        if (config.enableMetrics) {
+          metrics.recordSuccess();
+        }
+        return response;
+      } on ApiException catch (e) {
+        lastError = e;
+        if (e is CancellationException) break;
+      } catch (e, stackTrace) {
+        lastError = NetworkException(
+          message: 'Unexpected error during retry: $e',
+          request: newRequest,
+          error: e,
+          stackTrace: stackTrace,
+        );
+      }
     }
+
+    if (config.enableMetrics &&
+        (retried || attempt > 0) &&
+        lastError is! CancellationException) {
+      metrics.recordFailure();
+    }
+    return lastError;
+  }
+
+  /// Waits for [delay]. Returns `false` if [cancelToken] is cancelled first.
+  static Future<bool> _wait(Duration delay, ApiCancelToken? cancelToken) {
+    if (cancelToken?.isCancelled ?? false) return Future.value(false);
+    if (delay <= Duration.zero) return Future.value(true);
+    final completer = Completer<bool>();
+    final timer = Timer(delay, () {
+      if (!completer.isCompleted) completer.complete(true);
+    });
+    cancelToken?.whenCancelled.then((_) {
+      timer.cancel();
+      if (!completer.isCompleted) completer.complete(false);
+    });
+    return completer.future;
+  }
+
+  Duration _delayFor(ApiException error, int attempt) {
+    var delay = config.calculateDelay(attempt);
+    final retryAfterValues = error.response?.headers['retry-after'];
+    if (config.respectRetryAfter &&
+        retryAfterValues != null &&
+        retryAfterValues.isNotEmpty) {
+      final parsedDelay = _parseRetryAfter(retryAfterValues.first);
+      if (parsedDelay != null && parsedDelay > delay) {
+        delay = parsedDelay;
+      }
+    }
+    return delay;
   }
 
   bool _shouldRetry(
@@ -186,9 +223,9 @@ class RetryInterceptor implements ApiInterceptor {
 
   Duration? _parseRetryAfter(String retryAfter) {
     // Try parsing as seconds first
-    final seconds = int.tryParse(retryAfter);
+    final seconds = int.tryParse(retryAfter.trim());
     if (seconds != null) {
-      return Duration(seconds: seconds);
+      return seconds <= 0 ? Duration.zero : Duration(seconds: seconds);
     }
 
     // Try parsing as HTTP-date

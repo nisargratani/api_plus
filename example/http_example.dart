@@ -17,7 +17,7 @@ void main() async {
     final response = await api.request<Map<String, dynamic>>(
       const ApiRequest(path: '/users/1'),
     );
-    print('User: ${response.data}');
+    print('User: ${response.data!['name']}');
   } on ApiException catch (e) {
     print('Error: ${e.message}');
   }

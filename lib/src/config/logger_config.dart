@@ -91,8 +91,10 @@ class LoggerConfig {
 
   /// Keys whose values should be masked in log output.
   ///
-  /// Matched case-insensitively against header names and body keys.
-  /// Values for matching keys are replaced with [maskString].
+  /// Matched case-insensitively against request and response header names
+  /// and against keys of JSON/map bodies (at any depth). Values for
+  /// matching keys are replaced with [maskString] in every log format and
+  /// in the generated curl command.
   final Set<String> maskedKeys;
 
   /// Whether to include the equivalent curl command for each request.
@@ -131,7 +133,20 @@ class LoggerConfig {
     this.printResponseHeaders = true,
     this.printResponseBody = true,
     this.colors = true,
-    this.maskedKeys = const {'authorization', 'password', 'token', 'secret'},
+    this.maskedKeys = const {
+      'authorization',
+      'proxy-authorization',
+      'cookie',
+      'set-cookie',
+      'x-api-key',
+      'api_key',
+      'password',
+      'token',
+      'access_token',
+      'refresh_token',
+      'secret',
+      'client_secret',
+    },
     this.printCurl = true,
     this.maskString = '***',
     this.printExecutionTime = true,

@@ -10,8 +10,13 @@ import '../exceptions/api_exception.dart';
 /// The interceptor pipeline is:
 /// 1. [onRequest] — can modify the request or short-circuit with a response
 /// 2. Network call
-/// 3. [onResponse] — can modify the response
-/// 4. [onError] — can recover from errors or retry requests
+/// 3. [onResponse] — can modify the response (called for every HTTP
+///    status, including error statuses)
+/// 4. [onError] — can recover from errors or retry requests. Non-2xx
+///    responses reach it as a [ServerException].
+///
+/// All three hooks run in list order. Extend this class to override only
+/// the hooks you need.
 ///
 /// {@tool snippet}
 /// ```dart
