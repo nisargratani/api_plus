@@ -2,9 +2,9 @@ name: Dart CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "develop" ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ "main", "develop" ]
 
 jobs:
   analyze:
@@ -38,7 +38,8 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        sdk: [ "stable", "3.1.0" ]
+        # 3.4.0 is the minimum SDK declared in pubspec.yaml.
+        sdk: [ "stable", "3.4.0" ]
     steps:
       - uses: actions/checkout@v4
 
@@ -58,6 +59,15 @@ jobs:
 
       - name: Run tests
         run: dart test
+
+      # On the minimum SDK, verify the package also compiles against the
+      # lowest versions allowed by its dependency constraints. (Tests are not
+      # run here: the oldest test-tooling releases predate Dart 3.)
+      - name: Analyze with lowest dependency versions
+        if: matrix.sdk != 'stable'
+        run: |
+          dart pub downgrade
+          dart analyze lib
 
       - name: Run tests with coverage
         if: matrix.sdk == 'stable'

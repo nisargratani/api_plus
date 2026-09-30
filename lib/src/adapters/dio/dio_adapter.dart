@@ -1,6 +1,11 @@
+import 'dart:async';
+import 'dart:convert';
+
 import 'package:dio/dio.dart' as dio;
+
 import '../../core/api_request.dart';
 import '../../core/api_response.dart';
+import '../../core/internal_keys.dart';
 import '../../exceptions/api_exception.dart';
 import '../../interfaces/api_adapter.dart';
 import '../../interfaces/api_interceptor.dart';
@@ -40,16 +45,25 @@ class DioAdapter extends ApiAdapter with InterceptorPipeline {
   /// Creates a new [DioAdapter].
   ///
   /// If no [client] is provided, a new [dio.Dio] instance is created
-  /// with the given [baseUrl].
+  /// with the given [baseUrl]. The client (provided or not) is closed
+  /// by [close].
+  ///
+  /// [connectTimeout], [receiveTimeout], and [sendTimeout] become the
+  /// client's defaults; per-request values on [ApiRequest] override them.
   DioAdapter({
     required this.baseUrl,
     dio.Dio? client,
     this.defaultHeaders = const {},
     this.interceptors = const [],
+    Duration? connectTimeout,
+    Duration? receiveTimeout,
+    Duration? sendTimeout,
   }) : _client = client ?? dio.Dio(dio.BaseOptions(baseUrl: baseUrl)) {
-    if (client != null && client.options.baseUrl.isEmpty) {
-      client.options.baseUrl = baseUrl;
-    }
+    final options = _client.options;
+    if (options.baseUrl.isEmpty) options.baseUrl = baseUrl;
+    if (connectTimeout != null) options.connectTimeout = connectTimeout;
+    if (receiveTimeout != null) options.receiveTimeout = receiveTimeout;
+    if (sendTimeout != null) options.sendTimeout = sendTimeout;
   }
 
   /// Provides access to the underlying [dio.Dio] client.
@@ -58,70 +72,76 @@ class DioAdapter extends ApiAdapter with InterceptorPipeline {
   dio.Dio get client => _client;
 
   @override
-  Future<ApiResponse<T>> request<T>(ApiRequest request) async {
-    // 1. Run onRequest interceptors
-    final dynamic requestResult = await runOnRequest(request);
-    if (requestResult is ApiResponse) {
-      return requestResult as ApiResponse<T>;
-    }
-    final ApiRequest finalRequest = requestResult as ApiRequest;
+  Future<ApiResponse<T>> request<T>(ApiRequest request) {
+    return runPipeline<T>(request, _send);
+  }
 
+  Future<ApiResponse<dynamic>> _send(ApiRequest request) async {
+    final cancelToken = request.cancelToken;
+    dio.CancelToken? dioCancelToken;
+    if (cancelToken != null) {
+      final token = dioCancelToken = dio.CancelToken();
+      unawaited(cancelToken.whenCancelled.then((_) {
+        if (!token.isCancelled) token.cancel(cancelToken.reason);
+      }));
+    }
     try {
       final dioResponse = await _client.request<dynamic>(
-        finalRequest.path,
-        data: finalRequest.body,
-        queryParameters: finalRequest.queryParameters.isNotEmpty
-            ? finalRequest.queryParameters
-            : null,
+        request.path,
+        data: request.body,
+        queryParameters: _withoutNulls(request.queryParameters),
         options: dio.Options(
-          method: finalRequest.method.value,
-          headers: finalRequest.headers,
-          sendTimeout: finalRequest.sendTimeout,
-          receiveTimeout: finalRequest.receiveTimeout,
+          method: request.method.value,
+          headers: request.headers,
+          connectTimeout: request.connectTimeout,
+          sendTimeout: request.sendTimeout,
+          receiveTimeout: request.receiveTimeout,
         ),
+        cancelToken: dioCancelToken,
       );
-
-      final headers = <String, List<String>>{};
-      dioResponse.headers.map.forEach((key, value) {
-        headers[key] = value;
-      });
-
-      ApiResponse<dynamic> response = ApiResponse<dynamic>(
-        data: dioResponse.data,
-        statusCode: dioResponse.statusCode ?? 200,
-        headers: headers,
-        statusMessage: dioResponse.statusMessage,
-        isRedirect: dioResponse.isRedirect,
-        request: finalRequest,
-      );
-
-      // 2. Run onResponse interceptors
-      response = await runOnResponse(response);
-
-      if (!response.isSuccessful) {
-        throw ServerException.fromResponse(
-          message: 'Server returned ${response.statusCode}: '
-              '${response.statusMessage}',
-          request: finalRequest,
-          response: response,
-        );
+      return _toApiResponse(dioResponse, request);
+    } on dio.DioException catch (e, stackTrace) {
+      // Error statuses are returned (not thrown) so that the pipeline runs
+      // onResponse interceptors for them, exactly like the other adapters.
+      final response = e.response;
+      if (e.type == dio.DioExceptionType.badResponse && response != null) {
+        return _toApiResponse(response, request);
       }
-
-      return response as ApiResponse<T>;
+      throw _mapDioException(e, request, stackTrace);
     } on ApiException {
       rethrow;
-    } on dio.DioException catch (e, stackTrace) {
-      final apiException = _mapDioException(e, finalRequest, stackTrace);
-      return runOnError<T>(apiException);
     } catch (e, stackTrace) {
-      final apiException = NetworkException(
+      throw NetworkException(
         message: 'Unexpected error occurred.',
-        request: finalRequest,
+        request: request,
         error: e,
         stackTrace: stackTrace,
       );
-      return runOnError<T>(apiException);
     }
+  }
+
+  /// Null query parameters are omitted, as in the other adapters.
+  static Map<String, dynamic>? _withoutNulls(Map<String, dynamic> params) {
+    if (params.isEmpty) return null;
+    if (!params.values.contains(null)) return params;
+    return {
+      for (final entry in params.entries)
+        if (entry.value != null) entry.key: entry.value,
+    };
+  }
+
+  static ApiResponse<dynamic> _toApiResponse(
+    dio.Response<dynamic> response,
+    ApiRequest request,
+  ) {
+    return ApiResponse<dynamic>(
+      data: response.data,
+      statusCode: response.statusCode ?? 200,
+      headers: Map<String, List<String>>.of(response.headers.map),
+      statusMessage: response.statusMessage,
+      isRedirect: response.isRedirect,
+      request: request,
+    );
   }
 
   @override
@@ -188,6 +208,9 @@ class DioAdapter extends ApiAdapter with InterceptorPipeline {
           stackTrace: stackTrace,
         );
       case dio.DioExceptionType.cancel:
+        if (request.cancelToken?.isCancelled ?? false) {
+          return cancellationFor(request, error: e, stackTrace: stackTrace);
+        }
         return CancellationException(
           message: 'Request cancelled',
           request: request,
@@ -203,6 +226,14 @@ class DioAdapter extends ApiAdapter with InterceptorPipeline {
         );
       case dio.DioExceptionType.unknown:
       case dio.DioExceptionType.transformTimeout:
+        if (e.error is JsonUnsupportedObjectError) {
+          return SerializationException(
+            message: 'Request body could not be encoded as JSON: ${e.error}',
+            request: request,
+            error: e,
+            stackTrace: stackTrace,
+          );
+        }
         return NetworkException(
           message: e.message ?? 'Unknown network error',
           request: request,

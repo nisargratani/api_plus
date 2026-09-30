@@ -28,7 +28,9 @@ class CacheKeyGenerator {
         queryParameters.entries.toList()
           ..sort((a, b) => a.key.compareTo(b.key)),
       );
-      buffer.write(':${jsonEncode(sorted)}');
+      buffer.write(
+        ':${jsonEncode(sorted, toEncodable: (value) => value.toString())}',
+      );
     }
     return buffer.toString();
   }

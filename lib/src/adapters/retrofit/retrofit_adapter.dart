@@ -1,9 +1,14 @@
+import 'dart:async';
+
 import 'package:dio/dio.dart' as dio;
+
 import '../../config/cache_config.dart';
 import '../../config/logger_config.dart';
 import '../../config/retry_config.dart';
+import '../../core/api_cancel_token.dart';
 import '../../core/api_request.dart';
 import '../../core/api_response.dart';
+import '../../core/internal_keys.dart';
 import '../../exceptions/api_exception.dart';
 import '../../interfaces/api_interceptor.dart';
 import '../../interceptors/cache_interceptor.dart';
@@ -86,18 +91,16 @@ class RetrofitAdapter {
   /// All `api_plus` interceptors (retry, cache, logger) are active
   /// on this client via an internal bridge interceptor.
   dio.Dio get client {
-    if (_client != null) return _client!;
+    final existing = _client;
+    if (existing != null) return existing;
 
-    _client = dio.Dio(dio.BaseOptions(
+    final created = dio.Dio(dio.BaseOptions(
       baseUrl: _baseUrl,
       headers: _defaultHeaders,
     ));
-
-    _client!.interceptors.add(
-      _RetrofitBridgeInterceptor(_interceptors),
-    );
-
-    return _client!;
+    created.interceptors
+        .add(_RetrofitBridgeInterceptor(_interceptors, created));
+    return _client = created;
   }
 
   /// Closes the underlying Dio client.
@@ -114,7 +117,11 @@ class RetrofitAdapter {
 class _RetrofitBridgeInterceptor extends dio.Interceptor {
   final List<ApiInterceptor> _apiInterceptors;
 
-  _RetrofitBridgeInterceptor(this._apiInterceptors);
+  /// The client this interceptor is installed on. Retries and background
+  /// cache refreshes are sent through it, so they run the full pipeline.
+  final dio.Dio _client;
+
+  _RetrofitBridgeInterceptor(this._apiInterceptors, this._client);
 
   @override
   void onRequest(
@@ -129,43 +136,82 @@ class _RetrofitBridgeInterceptor extends dio.Interceptor {
     dio.RequestInterceptorHandler handler,
   ) async {
     try {
-      ApiRequest apiRequest = _dioOptionsToApiRequest(options);
+      final original = _dioOptionsToApiRequest(options);
+      ApiRequest apiRequest = original;
 
       for (final interceptor in _apiInterceptors) {
         final result = await interceptor.onRequest(apiRequest);
         if (result is ApiResponse) {
           // Short-circuit: return cached/mocked response
-          handler.resolve(dio.Response<dynamic>(
-            data: result.data,
-            statusCode: result.statusCode,
-            statusMessage: result.statusMessage,
-            requestOptions: options,
-            headers: dio.Headers.fromMap(
-              result.headers.map((k, v) => MapEntry(k, v)),
-            ),
-          ));
+          handler.resolve(_toDioResponse(result, options));
+          _scheduleRevalidation(result.request, options);
           return;
         } else if (result is ApiRequest) {
           apiRequest = result;
         }
       }
 
-      // Apply any modifications from interceptors back to Dio options
-      options.headers.addAll(apiRequest.headers);
-      if (apiRequest.extra.isNotEmpty) {
-        options.extra.addAll(apiRequest.extra);
-      }
-
+      _applyToOptions(original, apiRequest, options);
       handler.next(options);
-    } catch (e) {
+    } catch (e, stackTrace) {
       handler.reject(
         dio.DioException(
           requestOptions: options,
           error: e,
+          stackTrace: stackTrace,
           type: dio.DioExceptionType.unknown,
         ),
       );
     }
+  }
+
+  /// Writes the changes interceptors made to [modified] back into [options].
+  void _applyToOptions(
+    ApiRequest original,
+    ApiRequest modified,
+    dio.RequestOptions options,
+  ) {
+    if (modified.path != original.path) options.path = modified.path;
+    if (modified.method != original.method) {
+      options.method = modified.method.value;
+    }
+    if (!identical(modified.queryParameters, original.queryParameters)) {
+      options.queryParameters =
+          Map<String, dynamic>.of(modified.queryParameters);
+    }
+    if (!identical(modified.body, original.body)) options.data = modified.body;
+
+    // Only touch changed headers so non-string header values survive.
+    options.headers.removeWhere((key, _) => !modified.headers.containsKey(key));
+    modified.headers.forEach((key, value) {
+      if (original.headers[key] != value) options.headers[key] = value;
+    });
+
+    if (modified.connectTimeout != original.connectTimeout) {
+      options.connectTimeout = modified.connectTimeout;
+    }
+    if (modified.sendTimeout != original.sendTimeout) {
+      options.sendTimeout = modified.sendTimeout;
+    }
+    if (modified.receiveTimeout != original.receiveTimeout) {
+      options.receiveTimeout = modified.receiveTimeout;
+    }
+    options.extra.addAll(modified.extra);
+  }
+
+  void _scheduleRevalidation(
+    ApiRequest? servedFor,
+    dio.RequestOptions options,
+  ) {
+    final refresh = revalidationRequestFor(servedFor);
+    if (refresh == null) return;
+    // The stale response was already delivered; a failed refresh just
+    // leaves the stale entry cached (interceptors still see the error).
+    unawaited(
+      _client
+          .fetch<dynamic>(_toRequestOptions(refresh, options))
+          .then<void>((_) {}, onError: (_) {}),
+    );
   }
 
   @override
@@ -181,39 +227,22 @@ class _RetrofitBridgeInterceptor extends dio.Interceptor {
     dio.ResponseInterceptorHandler handler,
   ) async {
     try {
-      final headers = <String, List<String>>{};
-      response.headers.map.forEach((key, value) {
-        headers[key] = value;
-      });
-
-      ApiResponse<dynamic> apiResponse = ApiResponse<dynamic>(
-        data: response.data,
-        statusCode: response.statusCode ?? 200,
-        headers: headers,
-        statusMessage: response.statusMessage,
-        isRedirect: response.isRedirect,
-        request: _dioOptionsToApiRequest(response.requestOptions),
+      ApiResponse<dynamic> apiResponse = _toApiResponse(
+        response,
+        _dioOptionsToApiRequest(response.requestOptions),
       );
 
       for (final interceptor in _apiInterceptors) {
         apiResponse = await interceptor.onResponse(apiResponse);
       }
 
-      // Convert back to Dio response
-      handler.resolve(dio.Response<dynamic>(
-        data: apiResponse.data,
-        statusCode: apiResponse.statusCode,
-        statusMessage: apiResponse.statusMessage,
-        requestOptions: response.requestOptions,
-        headers: dio.Headers.fromMap(
-          apiResponse.headers.map((k, v) => MapEntry(k, v)),
-        ),
-      ));
-    } catch (e) {
+      handler.resolve(_toDioResponse(apiResponse, response.requestOptions));
+    } catch (e, stackTrace) {
       handler.reject(
         dio.DioException(
           requestOptions: response.requestOptions,
           error: e,
+          stackTrace: stackTrace,
           type: dio.DioExceptionType.unknown,
         ),
       );
@@ -236,62 +265,104 @@ class _RetrofitBridgeInterceptor extends dio.Interceptor {
       final apiRequest = _dioOptionsToApiRequest(err.requestOptions);
       ApiException apiException = _mapDioError(err, apiRequest);
 
-      // Create an invoker that retries via Dio
+      // Re-sends a request through this client's full pipeline. Failures
+      // are thrown as ApiException so interceptors (e.g. retry) handle them.
       Future<ApiResponse<dynamic>> invoker(ApiRequest request) async {
-        final retryOptions = dio.RequestOptions(
-          path: request.path,
-          method: request.method.value,
-          headers: request.headers,
-          queryParameters: request.queryParameters,
-          data: request.body,
-          baseUrl: err.requestOptions.baseUrl,
-          extra: request.extra,
-        );
-
-        final retryResponse = await dio.Dio(dio.BaseOptions(
-          baseUrl: err.requestOptions.baseUrl,
-        )).fetch<dynamic>(retryOptions);
-
-        final headers = <String, List<String>>{};
-        retryResponse.headers.map.forEach((key, value) {
-          headers[key] = value;
-        });
-
-        return ApiResponse<dynamic>(
-          data: retryResponse.data,
-          statusCode: retryResponse.statusCode ?? 200,
-          headers: headers,
-          statusMessage: retryResponse.statusMessage,
-          request: request,
-        );
+        try {
+          final retryResponse = await _client.fetch<dynamic>(
+            _toRequestOptions(request, err.requestOptions),
+          );
+          return _toApiResponse(retryResponse, request);
+        } on dio.DioException catch (e) {
+          throw _mapDioError(e, request);
+        }
       }
 
       for (final interceptor in _apiInterceptors) {
         final result = await interceptor.onError(apiException, invoker);
         if (result is ApiResponse) {
           // Recovered — convert to Dio response
-          handler.resolve(dio.Response<dynamic>(
-            data: result.data,
-            statusCode: result.statusCode,
-            statusMessage: result.statusMessage,
-            requestOptions: err.requestOptions,
-          ));
+          handler.resolve(_toDioResponse(result, err.requestOptions));
           return;
         } else if (result is ApiException) {
           apiException = result;
         }
       }
 
+      if (apiException is CancellationException &&
+          err.type != dio.DioExceptionType.cancel) {
+        final cancelError = apiException.error;
+        handler.reject(
+          cancelError is dio.DioException &&
+                  cancelError.type == dio.DioExceptionType.cancel
+              ? cancelError
+              : dio.DioException.requestCancelled(
+                  requestOptions: err.requestOptions,
+                  reason: err.requestOptions.cancelToken?.cancelError?.error,
+                ),
+        );
+        return;
+      }
       handler.reject(err);
-    } catch (e) {
+    } catch (e, stackTrace) {
       handler.reject(
         dio.DioException(
           requestOptions: err.requestOptions,
           error: e,
+          stackTrace: stackTrace,
           type: dio.DioExceptionType.unknown,
         ),
       );
     }
+  }
+
+  /// Builds options for re-sending [request], keeping the Dio-specific
+  /// settings (response type, validateStatus, ...) of [template].
+  dio.RequestOptions _toRequestOptions(
+    ApiRequest request,
+    dio.RequestOptions template,
+  ) {
+    return template.copyWith(
+      path: request.path,
+      method: request.method.value,
+      headers: Map<String, dynamic>.of(request.headers),
+      queryParameters: Map<String, dynamic>.of(request.queryParameters),
+      data: request.body,
+      extra: Map<String, dynamic>.of(request.extra),
+      connectTimeout: request.connectTimeout,
+      sendTimeout: request.sendTimeout,
+      receiveTimeout: request.receiveTimeout,
+    );
+  }
+
+  static ApiResponse<dynamic> _toApiResponse(
+    dio.Response<dynamic> response,
+    ApiRequest request,
+  ) {
+    return ApiResponse<dynamic>(
+      data: response.data,
+      statusCode: response.statusCode ?? 200,
+      headers: Map<String, List<String>>.of(response.headers.map),
+      statusMessage: response.statusMessage,
+      isRedirect: response.isRedirect,
+      request: request,
+    );
+  }
+
+  static dio.Response<dynamic> _toDioResponse(
+    ApiResponse<dynamic> response,
+    dio.RequestOptions options,
+  ) {
+    return dio.Response<dynamic>(
+      data: response.data,
+      statusCode: response.statusCode,
+      statusMessage: response.statusMessage,
+      requestOptions: options,
+      isRedirect: response.isRedirect,
+      headers: dio.Headers.fromMap(
+        response.headers.map((k, v) => MapEntry(k, List<String>.of(v))),
+      ),
+    );
   }
 
   ApiRequest _dioOptionsToApiRequest(dio.RequestOptions options) {
@@ -310,7 +381,21 @@ class _RetrofitBridgeInterceptor extends dio.Interceptor {
       receiveTimeout: options.receiveTimeout,
       sendTimeout: options.sendTimeout,
       extra: options.extra,
+      cancelToken: _linkCancelToken(options.cancelToken),
     );
+  }
+
+  /// Mirrors a Dio [token] as an [ApiCancelToken], so api_plus interceptors
+  /// (e.g. a pending retry delay) react to Retrofit's `@CancelRequest`.
+  static ApiCancelToken? _linkCancelToken(dio.CancelToken? token) {
+    if (token == null) return null;
+    final apiToken = ApiCancelToken();
+    if (token.isCancelled) {
+      apiToken.cancel(token.cancelError?.error);
+    } else {
+      unawaited(token.whenCancel.then((e) => apiToken.cancel(e.error)));
+    }
+    return apiToken;
   }
 
   HttpMethod _parseHttpMethod(String method) {

@@ -1,5 +1,6 @@
 import '../core/api_request.dart';
 import '../core/api_response.dart';
+import '../exceptions/api_exception.dart';
 import 'api_interceptor.dart';
 
 /// Defines the contract for an API adapter (e.g., Http, Dio).
@@ -31,8 +32,8 @@ abstract class ApiAdapter {
 
   /// The list of interceptors applied to requests and responses.
   ///
-  /// Interceptors are executed in order for requests and responses,
-  /// and in reverse order for errors.
+  /// Interceptors are executed in list order for requests, responses,
+  /// and errors.
   List<ApiInterceptor> get interceptors;
 
   /// Executes the given [request] and returns an [ApiResponse].
@@ -41,9 +42,15 @@ abstract class ApiAdapter {
   /// response data.
   ///
   /// Throws [ApiException] or its subclasses on failure:
-  /// - [NetworkException] for connection failures
-  /// - [ServerException] for HTTP error status codes
-  /// - [SerializationException] for parsing failures
+  /// - [NetworkException] (and [TimeoutException]) for transport failures
+  /// - [ServerException] subclasses for non-2xx HTTP status codes
+  /// - [SerializationException] when the body cannot be encoded, or the
+  ///   response data is not of type [T] (e.g. requesting
+  ///   `List<Map<String, dynamic>>` while the decoded JSON is a
+  ///   `List<dynamic>`; request `List<dynamic>` and convert instead)
+  ///
+  /// Errors thrown by interceptors that are not [ApiException]s are
+  /// propagated unchanged.
   Future<ApiResponse<T>> request<T>(ApiRequest request);
 
   /// Closes the adapter and releases any resources.

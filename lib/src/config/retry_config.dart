@@ -97,8 +97,8 @@ class RetryConfig {
 
   /// Callback invoked each time a retry attempt begins.
   ///
-  /// Receives the retry [retryCount] (1-indexed) and the [delay]
-  /// that will be waited before the attempt.
+  /// Receives the retry `retryCount` (1-indexed) and the `delay`
+  /// that will be waited before the attempt. Called before waiting.
   final void Function(int retryCount, Duration delay)? onRetry;
 
   /// Whether to respect the `Retry-After` header in the response.
@@ -160,6 +160,7 @@ class RetryConfig {
     // Delegate to custom strategy if provided
     if (customStrategy != null) {
       final delay = customStrategy!.getDelay(attempt);
+      if (delay.isNegative) return Duration.zero;
       return delay > maxDelay ? maxDelay : delay;
     }
 
@@ -171,7 +172,7 @@ class RetryConfig {
       case RetryBackoffStrategy.linear:
         delayMs *= attempt;
       case RetryBackoffStrategy.exponential:
-        delayMs *= math.pow(2, attempt - 1);
+        delayMs *= math.pow(2.0, attempt - 1);
     }
 
     if (addJitter) {
@@ -181,10 +182,11 @@ class RetryConfig {
       delayMs = delayMs * (1 + jitter);
     }
 
-    Duration delay = Duration(milliseconds: delayMs.round());
-    if (delay > maxDelay) {
-      delay = maxDelay;
-    }
+    // Cap before converting: large attempts overflow to infinity.
+    final maxMs = maxDelay.inMilliseconds.toDouble();
+    if (delayMs.isNaN || delayMs > maxMs) delayMs = maxMs;
+    if (delayMs < 0) delayMs = 0;
+    final delay = Duration(milliseconds: delayMs.round());
 
     return delay;
   }

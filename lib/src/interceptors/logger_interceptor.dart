@@ -119,6 +119,11 @@ class LoggerInterceptor implements ApiInterceptor {
     Future<ApiResponse<dynamic>> Function(ApiRequest) invoker,
   ) async {
     if (!config.isEnabled(LogLevel.error)) return error;
+    if (config.requestFilter != null &&
+        error.request != null &&
+        !config.requestFilter!(error.request!)) {
+      return error;
+    }
 
     final executionTime = _getExecutionTime(error.request);
 
@@ -142,7 +147,8 @@ class LoggerInterceptor implements ApiInterceptor {
               .writeln('$color│ ${reset}Status: ${error.response!.statusCode}');
         }
         if (executionTime != null && config.printExecutionTime) {
-          buffer.writeln('$color│ ${reset}Duration: ${executionTime}ms');
+          buffer.writeln(
+              '$color│ ${reset}Duration: ${executionTime.inMilliseconds}ms');
         }
         buffer.write(
             '$color└────────────────────────────────────────────────────────────$reset');
@@ -163,15 +169,78 @@ class LoggerInterceptor implements ApiInterceptor {
     );
   }
 
-  String _maskValue(String key, String value) {
-    if (config.maskedKeys.contains(key.toLowerCase())) {
-      return config.maskString;
-    }
-    return value;
-  }
+  late final Set<String> _maskedKeys =
+      config.maskedKeys.map((k) => k.toLowerCase()).toSet();
+
+  bool _isMasked(Object? key) =>
+      key is String && _maskedKeys.contains(key.toLowerCase());
 
   Map<String, String> _maskHeaders(Map<String, String> headers) {
-    return headers.map((key, value) => MapEntry(key, _maskValue(key, value)));
+    return headers.map(
+      (key, value) => MapEntry(key, _isMasked(key) ? config.maskString : value),
+    );
+  }
+
+  Map<String, List<String>> _maskResponseHeaders(
+    Map<String, List<String>> headers,
+  ) {
+    return headers.map(
+      (key, value) =>
+          MapEntry(key, _isMasked(key) ? [config.maskString] : value),
+    );
+  }
+
+  /// Returns a copy of [data] in which the values of masked keys are
+  /// replaced, recursing into maps and lists. JSON strings are decoded
+  /// first so that their keys are masked too.
+  dynamic _maskBody(dynamic data) {
+    if (data is String) {
+      final trimmed = data.trimLeft();
+      if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+        try {
+          return _maskBody(jsonDecode(data));
+        } on FormatException {
+          return data;
+        }
+      }
+      return data;
+    }
+    if (data is Map) {
+      return {
+        for (final entry in data.entries)
+          '${entry.key}':
+              _isMasked(entry.key) ? config.maskString : _maskBody(entry.value),
+      };
+    }
+    if (data is List && data is! List<int>) {
+      return [for (final item in data) _maskBody(item)];
+    }
+    return data;
+  }
+
+  /// JSON-encodes [data], falling back to `toString()` for values that are
+  /// not JSON-encodable, so logging never fails a request.
+  static String _encode(Object? data, {bool indent = false}) {
+    final encoder = indent
+        ? const JsonEncoder.withIndent('  ', _toEncodable)
+        : const JsonEncoder(_toEncodable);
+    return encoder.convert(data);
+  }
+
+  static Object? _toEncodable(Object? value) => value.toString();
+
+  static String _describePath(ApiRequest request) {
+    if (request.queryParameters.isEmpty) return request.path;
+    final params = <String, dynamic>{
+      for (final entry in request.queryParameters.entries)
+        if (entry.value != null)
+          entry.key: entry.value is Iterable
+              ? (entry.value as Iterable).map((e) => '$e').toList()
+              : '${entry.value}',
+    };
+    if (params.isEmpty) return request.path;
+    final separator = request.path.contains('?') ? '&' : '?';
+    return '${request.path}$separator${Uri(queryParameters: params).query}';
   }
 
   // ─── JSON Formatting ─────────────────────────────────────────────
@@ -180,11 +249,12 @@ class LoggerInterceptor implements ApiInterceptor {
     final logData = <String, dynamic>{
       'type': 'request',
       'method': request.method.value,
-      'url': request.path,
+      'url': _describePath(request),
       if (config.printRequestHeaders) 'headers': _maskHeaders(request.headers),
-      if (config.printRequestBody && request.body != null) 'body': request.body,
+      if (config.printRequestBody && request.body != null)
+        'body': _maskBody(request.body),
     };
-    _log(jsonEncode(logData));
+    _log(_encode(logData));
   }
 
   void _logJsonResponse(
@@ -194,13 +264,14 @@ class LoggerInterceptor implements ApiInterceptor {
     final logData = <String, dynamic>{
       'type': 'response',
       'statusCode': response.statusCode,
-      if (config.printResponseHeaders) 'headers': response.headers,
+      if (config.printResponseHeaders)
+        'headers': _maskResponseHeaders(response.headers),
       if (config.printResponseBody && response.data != null)
-        'body': response.data,
+        'body': _maskBody(response.data),
       if (executionTime != null && config.printExecutionTime)
         'durationMs': executionTime.inMilliseconds,
     };
-    _log(jsonEncode(logData));
+    _log(_encode(logData));
   }
 
   void _logJsonError(ApiException error, Duration? executionTime) {
@@ -208,11 +279,11 @@ class LoggerInterceptor implements ApiInterceptor {
       'type': 'error',
       'message': error.message,
       'statusCode': error.response?.statusCode,
-      'url': error.request?.path,
+      'url': error.request == null ? null : _describePath(error.request!),
       if (executionTime != null && config.printExecutionTime)
         'durationMs': executionTime.inMilliseconds,
     };
-    _log(jsonEncode(logData));
+    _log(_encode(logData));
   }
 
   // ─── Pretty Formatting ───────────────────────────────────────────
@@ -224,7 +295,8 @@ class LoggerInterceptor implements ApiInterceptor {
     final buffer = StringBuffer();
     buffer.writeln(
         '$color┌── Request ──────────────────────────────────────────────────$reset');
-    buffer.writeln('$color│ $reset${request.method.value} ${request.path}');
+    buffer.writeln(
+        '$color│ $reset${request.method.value} ${_describePath(request)}');
 
     if (config.printRequestHeaders && request.headers.isNotEmpty) {
       buffer.writeln('$color├─ Headers:$reset');
@@ -235,7 +307,7 @@ class LoggerInterceptor implements ApiInterceptor {
 
     if (config.printRequestBody && request.body != null) {
       buffer.writeln('$color├─ Body:$reset');
-      final bodyLines = _tryFormatJson(request.body).split('\n');
+      final bodyLines = _tryFormatJson(_maskBody(request.body)).split('\n');
       for (final line in bodyLines) {
         buffer.writeln('$color│ $reset  $line');
       }
@@ -268,14 +340,14 @@ class LoggerInterceptor implements ApiInterceptor {
 
     if (config.printResponseHeaders && response.headers.isNotEmpty) {
       buffer.writeln('$color├─ Headers:$reset');
-      response.headers.forEach((key, value) {
+      _maskResponseHeaders(response.headers).forEach((key, value) {
         buffer.writeln('$color│ $reset  $key: ${value.join(', ')}');
       });
     }
 
     if (config.printResponseBody && response.data != null) {
       buffer.writeln('$color├─ Body:$reset');
-      final bodyLines = _tryFormatJson(response.data).split('\n');
+      final bodyLines = _tryFormatJson(_maskBody(response.data)).split('\n');
       for (final line in bodyLines) {
         buffer.writeln('$color│ $reset  $line');
       }
@@ -288,7 +360,7 @@ class LoggerInterceptor implements ApiInterceptor {
   // ─── Compact Formatting ──────────────────────────────────────────
 
   void _logCompactRequest(ApiRequest request) {
-    _log('→ ${request.method.value} ${request.path}');
+    _log('→ ${request.method.value} ${_describePath(request)}');
   }
 
   void _logCompactResponse(
@@ -311,13 +383,12 @@ class LoggerInterceptor implements ApiInterceptor {
     });
 
     if (request.body != null) {
-      final bodyStr = request.body is String
-          ? request.body as String
-          : jsonEncode(request.body);
-      curl.write(" -d '${bodyStr.replaceAll("'", "'\\''")}' ");
+      final masked = _maskBody(request.body);
+      final bodyStr = masked is String ? masked : _encode(masked);
+      curl.write(" -d '${bodyStr.replaceAll("'", "'\\''")}'");
     }
 
-    curl.write(' "${request.path}"');
+    curl.write(' "${_describePath(request)}"');
 
     final color = config.colors ? '\x1B[36m' : ''; // Cyan
     final reset = config.colors ? '\x1B[0m' : '';
@@ -325,11 +396,13 @@ class LoggerInterceptor implements ApiInterceptor {
   }
 
   String _tryFormatJson(dynamic data) {
-    try {
-      final json = data is String ? jsonDecode(data) : data;
-      return const JsonEncoder.withIndent('  ').convert(json);
-    } catch (_) {
-      return data.toString();
+    if (data is String) {
+      try {
+        return _encode(jsonDecode(data), indent: true);
+      } on FormatException {
+        return data;
+      }
     }
+    return _encode(data, indent: true);
   }
 }

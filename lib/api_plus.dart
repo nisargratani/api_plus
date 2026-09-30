@@ -30,6 +30,7 @@
 library;
 
 // Core
+export 'src/core/api_cancel_token.dart';
 export 'src/core/api_request.dart';
 export 'src/core/api_response.dart';
 

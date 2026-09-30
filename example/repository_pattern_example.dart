@@ -55,7 +55,7 @@ class UserRepository {
     final response = await _api.request<Map<String, dynamic>>(
       ApiRequest(path: '/users/$id'),
     );
-    return User.fromJson(response.data as Map<String, dynamic>);
+    return User.fromJson(response.data!);
   }
 
   /// Fetches all users.
@@ -63,8 +63,11 @@ class UserRepository {
     final response = await _api.request<List<dynamic>>(
       const ApiRequest(path: '/users'),
     );
-    final list = response.data as List<dynamic>;
-    return list.cast<Map<String, dynamic>>().map(User.fromJson).toList();
+    // Decoded JSON lists are List<dynamic>; convert the items explicitly.
+    return response.data!
+        .cast<Map<String, dynamic>>()
+        .map(User.fromJson)
+        .toList();
   }
 
   /// Creates a new user.
@@ -80,7 +83,7 @@ class UserRepository {
         body: {'name': name, 'email': email},
       ),
     );
-    return User.fromJson(response.data as Map<String, dynamic>);
+    return User.fromJson(response.data!);
   }
 }
 

@@ -40,7 +40,7 @@ void main() async {
       ),
     );
     print('Status: ${response.statusCode}');
-    print('Title: ${response.data}');
+    print('Title: ${response.data!['title']}');
   } on ApiException catch (e) {
     print('Failed: ${e.message}');
   }
@@ -55,7 +55,7 @@ void main() async {
       ),
     );
     print('Status: ${response.statusCode}');
-    print('Data: ${response.data}');
+    print('Title: ${response.data!['title']}');
   } on ApiException catch (e) {
     print('Failed: ${e.message}');
   }

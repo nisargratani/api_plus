@@ -1,4 +1,5 @@
 import 'package:meta/meta.dart';
+import '../exceptions/api_exception.dart';
 import '../interfaces/cache_store.dart';
 import '../models/http_method.dart';
 
@@ -27,10 +28,12 @@ class CacheConfig {
   /// or similar directives.
   final Duration defaultTtl;
 
-  /// Maximum age for stale entries to be served during network failures.
+  /// Maximum age for stale entries to be served during network failures
+  /// or by stale-while-revalidate.
   ///
-  /// When a network request fails and a stale cache entry exists
-  /// that is younger than [staleTtl], the stale entry is served.
+  /// When a network request fails with a [NetworkException] and a cache
+  /// entry exists that is younger than [staleTtl] (measured from when it
+  /// was cached or last revalidated), that entry is served instead.
   final Duration staleTtl;
 
   /// When `true`, always serves from cache if available, ignoring
@@ -42,8 +45,13 @@ class CacheConfig {
 
   /// Custom function for generating cache keys.
   ///
-  /// Receives the HTTP method and full URL. When `null`, a default
-  /// key based on method, path, and query parameters is used.
+  /// Receives the HTTP method and the request path including its query
+  /// parameters (sorted by name), e.g. `/users?page=2`. When `null`, a
+  /// default key based on method, path, and query parameters is used.
+  ///
+  /// Request headers are not part of the default key. If responses depend
+  /// on the caller (e.g. the `Authorization` header), include that in your
+  /// key or clear the store when the user changes.
   final String Function(String method, String url)? keyBuilder;
 
   /// HTTP methods that are eligible for caching.
@@ -54,9 +62,11 @@ class CacheConfig {
 
   /// When `true`, enables the stale-while-revalidate pattern.
   ///
-  /// Stale entries are served immediately while a background request
-  /// refreshes the cache. The refreshed response is stored for
-  /// subsequent requests.
+  /// Expired entries younger than [staleTtl] are served immediately while
+  /// the adapter refreshes them with a background request (using
+  /// `If-None-Match`/`If-Modified-Since` when available). The refreshed
+  /// response is stored for subsequent requests. A failed refresh leaves
+  /// the stale entry in place.
   final bool enableStaleWhileRevalidate;
 
   /// Whether to collect cache metrics.

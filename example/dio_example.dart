@@ -24,7 +24,7 @@ void main() async {
     final response = await api.request<Map<String, dynamic>>(
       const ApiRequest(path: '/posts/1'),
     );
-    print('Post title: ${response.data}');
+    print('Post title: ${response.data!['title']}');
 
     // POST request with body
     final createResponse = await api.request<Map<String, dynamic>>(

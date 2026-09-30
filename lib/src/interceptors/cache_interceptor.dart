@@ -1,6 +1,8 @@
+import '../cache/memory_cache_store.dart';
 import '../config/cache_config.dart';
 import '../core/api_request.dart';
 import '../core/api_response.dart';
+import '../core/internal_keys.dart';
 import '../exceptions/api_exception.dart';
 import '../interfaces/api_interceptor.dart';
 import '../interfaces/cache_store.dart';
@@ -42,7 +44,7 @@ class CacheInterceptor implements ApiInterceptor {
 
   String _buildKey(ApiRequest request) {
     if (config.keyBuilder != null) {
-      return config.keyBuilder!(request.method.value, request.path);
+      return config.keyBuilder!(request.method.value, _pathWithQuery(request));
     }
     final buffer = StringBuffer('${request.method.value}:${request.path}');
     if (request.queryParameters.isNotEmpty) {
@@ -55,17 +57,38 @@ class CacheInterceptor implements ApiInterceptor {
     return buffer.toString();
   }
 
+  /// The request path with its query parameters encoded (sorted by key),
+  /// as passed to [CacheConfig.keyBuilder].
+  static String _pathWithQuery(ApiRequest request) {
+    final params = <String, dynamic>{};
+    final keys = request.queryParameters.keys.toList()..sort();
+    for (final key in keys) {
+      final value = request.queryParameters[key];
+      if (value == null) continue;
+      params[key] = value is Iterable
+          ? value.map((e) => e.toString()).toList()
+          : value.toString();
+    }
+    if (params.isEmpty) return request.path;
+    final separator = request.path.contains('?') ? '&' : '?';
+    return '${request.path}$separator${Uri(queryParameters: params).query}';
+  }
+
+  bool _isCacheable(ApiRequest request) =>
+      config.cacheableMethods.contains(request.method);
+
   @override
   Future<dynamic> onRequest(ApiRequest request) async {
-    if (config.bypassCache ||
-        !config.cacheableMethods.contains(request.method)) {
+    if (config.bypassCache || !_isCacheable(request)) {
       return request;
     }
 
     final key = _buildKey(request);
     final entry = await config.store.get(key);
+    // Background refresh started by stale-while-revalidate: go to the network.
+    final revalidating = request.extra[revalidatingExtraKey] == true;
 
-    if (entry != null) {
+    if (entry != null && !revalidating) {
       if (config.forceCache || !entry.isExpired) {
         // Return cached response immediately
         if (config.enableMetrics) {
@@ -74,27 +97,31 @@ class CacheInterceptor implements ApiInterceptor {
         return entry.response;
       }
 
-      // Entry is expired — add conditional headers for revalidation
-      final extraHeaders = <String, String>{};
-      if (entry.eTag != null) {
-        extraHeaders['If-None-Match'] = entry.eTag!;
-      }
-      if (entry.lastModified != null) {
-        extraHeaders['If-Modified-Since'] = entry.lastModified!;
-      }
-
-      if (extraHeaders.isNotEmpty) {
-        final newHeaders = Map<String, String>.from(request.headers)
-          ..addAll(extraHeaders);
-        return request.copyWith(headers: newHeaders);
+      if (config.enableStaleWhileRevalidate && entry.age <= config.staleTtl) {
+        // Serve the stale entry now; the adapter refreshes it in the
+        // background because of the revalidate marker.
+        if (config.enableMetrics) {
+          metrics.recordHit();
+        }
+        return entry.response.copyWith(
+          request: withExtras(request, {revalidateExtraKey: true}),
+        );
       }
     }
 
-    if (config.enableMetrics) {
+    if (config.enableMetrics && !revalidating) {
       metrics.recordMiss();
     }
 
-    return request;
+    if (entry == null) return request;
+
+    // Entry is expired — add conditional headers for revalidation
+    final extraHeaders = <String, String>{
+      if (entry.eTag != null) 'If-None-Match': entry.eTag!,
+      if (entry.lastModified != null) 'If-Modified-Since': entry.lastModified!,
+    };
+    if (extraHeaders.isEmpty) return request;
+    return request.copyWith(headers: {...request.headers, ...extraHeaders});
   }
 
   @override
@@ -103,49 +130,31 @@ class CacheInterceptor implements ApiInterceptor {
   ) async {
     final request = response.request;
 
-    if (request == null || !config.cacheableMethods.contains(request.method)) {
+    if (request == null || !_isCacheable(request)) {
       return response;
     }
 
     // Handle 304 Not Modified — return the cached response
     if (response.statusCode == 304) {
-      final key = _buildKey(request);
-      final entry = await config.store.get(key);
-      if (entry != null) {
-        if (config.enableMetrics) {
-          metrics.recordHit();
-        }
-        return entry.response;
-      }
-      return response;
+      return await _handleNotModified(request, response) ?? response;
     }
 
     // Only cache successful responses
-    if (response.statusCode >= 200 && response.statusCode < 300) {
-      final cacheControl = _getCacheControlHeader(response);
-      if (cacheControl.contains('no-store')) {
-        return response;
-      }
+    if (response.isSuccessful) {
+      final ttl = _ttlFor(response);
+      if (ttl == null) return response;
 
-      Duration ttl = config.defaultTtl;
-      final maxAgeMatch = RegExp(r'max-age=(\d+)').firstMatch(cacheControl);
-      if (maxAgeMatch != null) {
-        ttl = Duration(seconds: int.parse(maxAgeMatch.group(1)!));
-      }
-
-      final key = _buildKey(request);
-      final eTag = _getHeaderValue(response, 'etag');
-      final lastModified = _getHeaderValue(response, 'last-modified');
-
-      final entry = CacheEntry(
-        response: response,
-        cachedAt: DateTime.now(),
-        expiresAt: DateTime.now().add(ttl),
-        eTag: eTag,
-        lastModified: lastModified,
+      final now = DateTime.now();
+      await _put(
+        _buildKey(request),
+        CacheEntry(
+          response: response,
+          cachedAt: now,
+          expiresAt: now.add(ttl),
+          eTag: _getHeaderValue(response, 'etag'),
+          lastModified: _getHeaderValue(response, 'last-modified'),
+        ),
       );
-
-      await config.store.put(key, entry);
     }
 
     return response;
@@ -156,30 +165,104 @@ class CacheInterceptor implements ApiInterceptor {
     ApiException error,
     Future<ApiResponse<dynamic>> Function(ApiRequest) invoker,
   ) async {
-    // Serve stale cache during network failures
-    if (error is NetworkException &&
-        error.request != null &&
-        config.cacheableMethods.contains(error.request!.method)) {
-      final key = _buildKey(error.request!);
-      final entry = await config.store.get(key);
+    final request = error.request;
+    if (request == null || !_isCacheable(request)) {
+      return error;
+    }
 
-      if (entry != null) {
-        final staleAge = DateTime.now().difference(entry.cachedAt);
-        if (staleAge <= config.staleTtl) {
-          if (config.enableMetrics) {
-            metrics.recordStaleHit();
-          }
-          return entry.response;
+    // Clients that treat 304 as an error (e.g. Dio's default validateStatus)
+    final response = error.response;
+    if (error is ServerException &&
+        response != null &&
+        response.statusCode == 304) {
+      return await _handleNotModified(request, response) ?? error;
+    }
+
+    // Serve stale cache during network failures
+    if (error is NetworkException) {
+      final entry = await config.store.get(_buildKey(request));
+      if (entry != null && entry.age <= config.staleTtl) {
+        if (config.enableMetrics) {
+          metrics.recordStaleHit();
         }
+        return entry.response;
       }
     }
     return error;
   }
 
+  /// Stores [entry], recording evictions it causes in [metrics].
+  Future<void> _put(String key, CacheEntry entry) {
+    final store = config.store;
+    if (!config.enableMetrics || store is! MemoryCacheStore) {
+      return store.put(key, entry);
+    }
+    // MemoryCacheStore evicts synchronously inside put(), so reading the
+    // count right after the call attributes exactly this write's evictions.
+    final before = store.evictionCount;
+    final done = store.put(key, entry);
+    for (var i = before; i < store.evictionCount; i++) {
+      metrics.recordEviction();
+    }
+    return done;
+  }
+
+  /// Serves the cached entry for a `304 Not Modified` [response] and
+  /// renews its freshness. Returns `null` if nothing is cached.
+  Future<ApiResponse<dynamic>?> _handleNotModified(
+    ApiRequest request,
+    ApiResponse<dynamic> response,
+  ) async {
+    final key = _buildKey(request);
+    final entry = await config.store.get(key);
+    if (entry == null) return null;
+
+    final ttl = _ttlFor(response) ?? Duration.zero;
+    final now = DateTime.now();
+    await _put(
+      key,
+      CacheEntry(
+        response: entry.response,
+        cachedAt: now,
+        expiresAt: now.add(ttl),
+        eTag: _getHeaderValue(response, 'etag') ?? entry.eTag,
+        lastModified:
+            _getHeaderValue(response, 'last-modified') ?? entry.lastModified,
+      ),
+    );
+    if (config.enableMetrics) {
+      metrics.recordHit();
+    }
+    return entry.response;
+  }
+
+  /// How long [response] may be served from cache, or `null` if it must
+  /// not be stored (`Cache-Control: no-store`).
+  Duration? _ttlFor(ApiResponse<dynamic> response) {
+    final cacheControl = _getCacheControlHeader(response);
+    if (cacheControl.contains('no-store')) return null;
+    // `no-cache` responses may be stored but must be revalidated before use.
+    if (cacheControl.contains('no-cache')) return Duration.zero;
+
+    final maxAge = _maxAgePattern.firstMatch(cacheControl)?.group(1);
+    if (maxAge == null) return config.defaultTtl;
+    final seconds = int.tryParse(maxAge);
+    // Values too large for an int are effectively "forever".
+    if (seconds == null || seconds > _maxTtlSeconds) {
+      return const Duration(seconds: _maxTtlSeconds);
+    }
+    return Duration(seconds: seconds);
+  }
+
+  static final _maxAgePattern = RegExp(r'(?:^|[,\s])max-age\s*=\s*"?(\d+)');
+
+  /// Ten years, the cap applied to very large `max-age` values.
+  static const _maxTtlSeconds = 10 * 365 * 24 * 60 * 60;
+
   String _getCacheControlHeader(ApiResponse<dynamic> response) {
     final values = response.headers['cache-control'];
     if (values == null || values.isEmpty) return '';
-    return values.first.toLowerCase();
+    return values.join(',').toLowerCase();
   }
 
   String? _getHeaderValue(ApiResponse<dynamic> response, String name) {

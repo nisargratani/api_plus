@@ -19,7 +19,18 @@ void main() {
       expect(config.requestFilter, isNull);
       expect(config.filterStatusCodes, isNull);
       expect(
-          config.maskedKeys, {'authorization', 'password', 'token', 'secret'});
+          config.maskedKeys,
+          containsAll(
+              <String>{'authorization', 'password', 'token', 'secret'}));
+      expect(
+          config.maskedKeys,
+          containsAll(<String>{
+            'cookie',
+            'set-cookie',
+            'x-api-key',
+            'access_token',
+            'refresh_token',
+          }));
     });
 
     group('isEnabled', () {
