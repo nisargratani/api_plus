@@ -529,10 +529,14 @@ class SerializationException extends ApiException {
   });
 }
 
-/// Thrown when retry limits are exceeded.
+/// Describes a request that failed after all retry attempts.
 ///
-/// Contains information about the number of attempts made and the
-/// total elapsed time.
+/// The built-in `RetryInterceptor` does **not** throw it: when retries are
+/// exhausted it returns the last attempt's error (e.g. a
+/// [ServiceUnavailableException] or a [NetworkException]), so callers can
+/// handle the actual status. Use this type in your own interceptors or
+/// `RetryStrategy` code if you want to wrap that error, with the number of
+/// attempts made and the total elapsed time.
 class RetryLimitExceededException extends ApiException {
   /// The number of retry attempts that were made.
   final int attemptsMade;
@@ -564,10 +568,13 @@ class ConfigurationException extends ApiException {
   });
 }
 
-/// Thrown when an error occurs in the caching layer.
+/// Describes an error in the caching layer (reading, writing, or evicting
+/// entries of a cache store).
 ///
-/// This can occur during read, write, or eviction operations on
-/// the cache store.
+/// The built-in `CacheInterceptor` does **not** throw it: a cache is an
+/// optimisation, so a failing store is treated as a cache miss (on read) or
+/// skipped (on write) and the request goes to the network. Use this type in
+/// your own `CacheStore` or interceptors to report cache errors.
 class CacheException extends ApiException {
   /// Creates a [CacheException].
   const CacheException({

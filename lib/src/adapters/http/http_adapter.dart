@@ -7,6 +7,7 @@ import 'package:http/http.dart' as http;
 import '../../core/api_request.dart';
 import '../../core/api_response.dart';
 import '../../core/internal_keys.dart';
+import '../../core/request_url.dart';
 import '../../exceptions/api_exception.dart';
 import '../../interfaces/api_adapter.dart';
 import '../../interfaces/api_interceptor.dart';
@@ -39,6 +40,9 @@ import '../adapter_mixin.dart';
 /// cancelled, the underlying request is aborted. In browsers, connecting and
 /// uploading cannot be observed, so only [receiveTimeout] applies there.
 ///
+/// [close] lets requests that are in flight finish before the client is
+/// closed, unless `force` is `true`.
+///
 /// {@tool snippet}
 /// ```dart
 /// final adapter = HttpAdapter(
@@ -55,6 +59,15 @@ import '../adapter_mixin.dart';
 /// {@end-tool}
 class HttpAdapter extends ApiAdapter with InterceptorPipeline {
   final http.Client _client;
+
+  /// Network calls currently in progress.
+  int _activeSends = 0;
+
+  /// Whether [close] was called; no new network calls are started.
+  bool _closed = false;
+
+  /// Whether [_client] has been closed.
+  bool _clientClosed = false;
 
   @override
   final String baseUrl;
@@ -100,6 +113,9 @@ class HttpAdapter extends ApiAdapter with InterceptorPipeline {
   }
 
   Future<ApiResponse<dynamic>> _send(ApiRequest request) async {
+    if (_closed) {
+      throw const ConfigurationException(message: 'HttpAdapter is closed');
+    }
     final Uri uri;
     try {
       uri = _buildUri(request);
@@ -120,6 +136,11 @@ class HttpAdapter extends ApiAdapter with InterceptorPipeline {
     // One watchdog enforces the timeout of the current phase and reacts to
     // cancellation. When it fires, it aborts the request and fails `failure`,
     // which is raced against every await below.
+    //
+    // The closures below reach the request only through `active`, which is
+    // cleared when the call ends: the client may keep them (e.g. on an idle
+    // keep-alive connection), and must not keep the request and its body.
+    ApiRequest? active = request;
     final abort = async.Completer<void>();
     final failure = async.Completer<Never>();
     async.Timer? timer;
@@ -143,17 +164,17 @@ class HttpAdapter extends ApiAdapter with InterceptorPipeline {
                 message: '${_phaseLabel(type)} timed out after '
                     '${timeout.inMilliseconds}ms.',
                 timeoutType: type,
-                request: request,
+                request: active,
               ));
             });
     }
 
-    final cancelToken = request.cancelToken;
-    if (cancelToken != null) {
-      async.unawaited(
-        cancelToken.whenCancelled.then((_) => fail(cancellationFor(request))),
-      );
-    }
+    // Removed when the request finishes, so a long-lived token does not
+    // keep completed requests reachable.
+    final removeCancelListener = request.cancelToken?.addCancelListener(() {
+      final pending = active;
+      if (pending != null) fail(cancellationFor(pending));
+    });
 
     final httpRequest = _PhasedRequest(
       request.method.value,
@@ -167,6 +188,7 @@ class HttpAdapter extends ApiAdapter with InterceptorPipeline {
     )..headers.addAll(headers);
 
     arm(connect, TimeoutType.connection);
+    _activeSends++;
     try {
       final streamed = await Future.any<http.StreamedResponse>([
         _client.send(httpRequest),
@@ -223,7 +245,11 @@ class HttpAdapter extends ApiAdapter with InterceptorPipeline {
       );
     } finally {
       finished = true;
+      active = null;
       timer?.cancel();
+      removeCancelListener?.call();
+      _activeSends--;
+      if (_closed && _activeSends == 0) _closeClient();
     }
   }
 
@@ -318,10 +344,14 @@ class HttpAdapter extends ApiAdapter with InterceptorPipeline {
     }
   }
 
+  /// Throws a [FormatException] for an invalid URL, including a malformed
+  /// absolute URL (which must not be sent to [baseUrl] as a relative path).
   Uri _buildUri(ApiRequest request) {
-    final parsed = Uri.tryParse(request.path);
     final Uri uri;
-    if (parsed != null && parsed.hasScheme) {
+    final parsed = Uri.tryParse(request.path);
+    if (looksLikeAbsoluteUrl(request.path)) {
+      uri = parseAbsoluteUrl(request.path);
+    } else if (parsed != null && parsed.hasScheme) {
       uri = parsed;
     } else {
       final basePath = baseUrl.endsWith('/')
@@ -346,8 +376,22 @@ class HttpAdapter extends ApiAdapter with InterceptorPipeline {
     );
   }
 
+  /// Closes the adapter and its `http.Client`.
+  ///
+  /// With `force: false` (the default), requests that are in flight finish
+  /// normally and the client is closed when the last one completes. With
+  /// `force: true`, the client is closed immediately and in-flight requests
+  /// fail. Either way, network calls started after [close] (new requests and
+  /// retries) fail with a [ConfigurationException] without being retried.
   @override
   void close({bool force = false}) {
+    _closed = true;
+    if (force || _activeSends == 0) _closeClient();
+  }
+
+  void _closeClient() {
+    if (_clientClosed) return;
+    _clientClosed = true;
     _client.close();
   }
 }

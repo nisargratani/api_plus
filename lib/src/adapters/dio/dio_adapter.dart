@@ -6,6 +6,7 @@ import 'package:dio/dio.dart' as dio;
 import '../../core/api_request.dart';
 import '../../core/api_response.dart';
 import '../../core/internal_keys.dart';
+import '../../core/request_url.dart';
 import '../../exceptions/api_exception.dart';
 import '../../interfaces/api_adapter.dart';
 import '../../interfaces/api_interceptor.dart';
@@ -32,6 +33,9 @@ import '../adapter_mixin.dart';
 /// {@end-tool}
 class DioAdapter extends ApiAdapter with InterceptorPipeline {
   final dio.Dio _client;
+
+  /// Whether [close] was called; no new network calls are started.
+  bool _closed = false;
 
   @override
   final String baseUrl;
@@ -77,13 +81,21 @@ class DioAdapter extends ApiAdapter with InterceptorPipeline {
   }
 
   Future<ApiResponse<dynamic>> _send(ApiRequest request) async {
+    if (_closed) {
+      throw const ConfigurationException(message: 'DioAdapter is closed');
+    }
+    _validateUrl(request.path);
+
     final cancelToken = request.cancelToken;
     dio.CancelToken? dioCancelToken;
+    void Function()? removeCancelListener;
     if (cancelToken != null) {
       final token = dioCancelToken = dio.CancelToken();
-      unawaited(cancelToken.whenCancelled.then((_) {
+      // Removed when the request finishes, so a long-lived token does not
+      // keep completed requests (and their bodies) reachable.
+      removeCancelListener = cancelToken.addCancelListener(() {
         if (!token.isCancelled) token.cancel(cancelToken.reason);
-      }));
+      });
     }
     try {
       final dioResponse = await _client.request<dynamic>(
@@ -117,6 +129,25 @@ class DioAdapter extends ApiAdapter with InterceptorPipeline {
         error: e,
         stackTrace: stackTrace,
       );
+    } finally {
+      removeCancelListener?.call();
+    }
+  }
+
+  /// Throws a [ConfigurationException] if Dio could not build a valid URL
+  /// from [path] and the client's base URL. Checked before sending, so an
+  /// invalid URL is not reported as a (retryable) network error.
+  void _validateUrl(String path) {
+    try {
+      if (looksLikeAbsoluteUrl(path)) parseAbsoluteUrl(path);
+      // The same URL resolution Dio applies when it sends the request.
+      dio.RequestOptions(path: path, baseUrl: _client.options.baseUrl).uri;
+    } on FormatException catch (e, stackTrace) {
+      throw ConfigurationException(
+        message: 'Invalid request URL: ${e.message}',
+        error: e,
+        stackTrace: stackTrace,
+      );
     }
   }
 
@@ -130,12 +161,14 @@ class DioAdapter extends ApiAdapter with InterceptorPipeline {
     };
   }
 
+  /// An empty body is `null`, as with `HttpAdapter` (Dio yields `''`).
   static ApiResponse<dynamic> _toApiResponse(
     dio.Response<dynamic> response,
     ApiRequest request,
   ) {
+    final data = response.data;
     return ApiResponse<dynamic>(
-      data: response.data,
+      data: data is String && data.isEmpty ? null : data,
       statusCode: response.statusCode ?? 200,
       headers: Map<String, List<String>>.of(response.headers.map),
       statusMessage: response.statusMessage,
@@ -144,8 +177,15 @@ class DioAdapter extends ApiAdapter with InterceptorPipeline {
     );
   }
 
+  /// Closes the adapter and its Dio client.
+  ///
+  /// With `force: false` (the default), requests that are in flight finish
+  /// normally; with `force: true`, they are aborted. Either way, network
+  /// calls started after [close] (new requests and retries) fail with a
+  /// [ConfigurationException] without being retried.
   @override
   void close({bool force = false}) {
+    _closed = true;
     _client.close(force: force);
   }
 
@@ -192,8 +232,9 @@ class DioAdapter extends ApiAdapter with InterceptorPipeline {
           respHeaders[key] = value;
         });
 
+        final data = e.response?.data;
         final apiResp = ApiResponse<dynamic>(
-          data: e.response?.data,
+          data: data is String && data.isEmpty ? null : data,
           statusCode: e.response?.statusCode ?? 500,
           headers: respHeaders,
           statusMessage: e.response?.statusMessage,
@@ -230,6 +271,19 @@ class DioAdapter extends ApiAdapter with InterceptorPipeline {
           return SerializationException(
             message: 'Request body could not be encoded as JSON: ${e.error}',
             request: request,
+            error: e,
+            stackTrace: stackTrace,
+          );
+        }
+        // The URL is validated before sending, so a FormatException here
+        // comes from decoding the response body (e.g. malformed JSON).
+        if (e.error is FormatException) {
+          final response = e.response;
+          return SerializationException(
+            message: 'Response body could not be decoded: ${e.error}',
+            request: request,
+            response:
+                response == null ? null : _toApiResponse(response, request),
             error: e,
             stackTrace: stackTrace,
           );

@@ -23,7 +23,7 @@ and **Retrofit** clients.
 
 ```yaml
 dependencies:
-  api_plus: ^0.0.3
+  api_plus: ^0.0.4
 ```
 
 Requires Dart 3.4+ (Flutter 3.22+). Pure Dart — no platform channels.
@@ -65,7 +65,9 @@ Future<void> main() async {
 
 In Flutter, create the adapter once (for example in a repository or in
 `initState`) and call `close()` when you no longer need it (for example in
-`dispose`).
+`dispose`). `close()` lets requests that are already in flight finish;
+`close(force: true)` aborts them. Requests started after `close()` (including
+retries) fail with a `ConfigurationException` and are not retried.
 
 ## Making requests
 
@@ -88,6 +90,10 @@ await api.request<Map<String, dynamic>>(const ApiRequest(
 await api.request<dynamic>(const ApiRequest(path: 'https://other.example.com/x'));
 ```
 
+A path that starts like an absolute URL (`scheme://`) but cannot be parsed or
+has no host (e.g. `http://[::1/users`) throws a `ConfigurationException`; it
+is never sent to the base URL, and it is not retried.
+
 **Typed responses.** `request<T>` checks that the decoded body is a `T`; if it
 is not, it throws a `SerializationException`. Decoded JSON is made of
 `Map<String, dynamic>` and `List<dynamic>`, so ask for those and convert:
@@ -102,7 +108,8 @@ final users = response.data!
 
 Requesting `List<Map<String, dynamic>>` directly throws, because the decoded
 list is a `List<dynamic>`. Non-JSON responses (e.g. `text/plain`) are returned
-as `String`.
+as `String`. An empty body (e.g. `204 No Content`) is `null` on every adapter,
+so `request<Map<String, dynamic>>` works for a `DELETE` that returns 204.
 
 **Timeouts.** Set defaults with `withConnectTimeout`, `withSendTimeout`, and
 `withReceiveTimeout` (or the adapter constructors); `ApiRequest.connectTimeout`,
@@ -153,7 +160,8 @@ class _FeedScreenState extends State<FeedScreen> {
 }
 ```
 
-A cancelled token stays cancelled; create a new one for new requests. With
+A cancelled token stays cancelled; create a new one for new requests. A
+long-lived token does not keep completed requests in memory. With
 `RetrofitAdapter`, use Dio's `CancelToken` (Retrofit's `@CancelRequest()`) as
 usual; it also stops api_plus retry delays.
 
@@ -170,13 +178,18 @@ Every adapter runs the same steps:
    failures (`NetworkException`, `TimeoutException`). An interceptor may
    return an `ApiResponse` to recover.
 
-`ApiBuilder` installs interceptors in the order cache → retry → logger →
-your interceptors (`addInterceptor`). Retries are re-sent through the whole
-pipeline, so the logger and cache see every attempt.
+`ApiBuilder` and `RetrofitAdapter` install interceptors in the order
+retry → cache → logger → your interceptors (`addInterceptor`). Retries are
+re-sent through the whole pipeline, so the logger and cache see every attempt.
+Retry comes first so that its `onError` runs before the cache's: a failed
+request is retried first, and a stale cache entry is served only once the
+retry interceptor gives up (retries exhausted, error not retryable, offline,
+or out of time). If you build the interceptor list yourself, put
+`RetryInterceptor` before `CacheInterceptor` to get the same behavior.
 
 Errors thrown by your own interceptors that are not `ApiException`s (for
 example a `StateError` from a bug) are propagated unchanged and are not
-retried.
+retried, also when they happen during a retry.
 
 ### Custom interceptors
 
@@ -201,6 +214,13 @@ class AuthInterceptor extends ApiInterceptor {
 final api = ApiBuilder(baseUrl).addInterceptor(AuthInterceptor(() => token)).build();
 ```
 
+`copyWith` keeps a field's current value when you pass `null`. To remove a
+nullable field, use `copyWithout`, e.g. `request.copyWithout(body: true)` or
+`response.copyWithout(data: true)`.
+
+A response served from the cache reports the current request as
+`response.request` (not the request that originally filled the cache).
+
 ## Retry
 
 ```dart
@@ -220,6 +240,21 @@ const retryConfig = RetryConfig(
 
 By default only idempotent methods (GET, HEAD, OPTIONS, PUT, DELETE) are
 retried, for the status codes above and for network errors and timeouts.
+Malformed response bodies (`SerializationException`) and invalid URLs
+(`ConfigurationException`) are not retried.
+
+**`Retry-After`.** With `respectRetryAfter` (the default), a `Retry-After`
+header (seconds or an HTTP date) replaces the backoff delay when it is longer.
+No wait ever exceeds `maxDelay`, and no wait may end after
+`maxElapsedDuration`: if the server asks for longer, the request is not
+retried and the error is returned right away. The requested delay is still
+available to you:
+
+```dart
+} on TooManyRequestsException catch (e) {
+  final retryAfter = e.response?.headers['retry-after']?.first;
+}
+```
 
 - `shouldRetryException` replaces the status-code and network-error checks.
 - A `customStrategy` (`RetryStrategy`) replaces `maxRetries`, the method and
@@ -241,20 +276,49 @@ final cacheConfig = CacheConfig(
 - Only successful responses to `cacheableMethods` (GET by default) are stored.
 - `Cache-Control: max-age` sets the lifetime, `no-store` prevents storing, and
   `no-cache` stores the response but revalidates it before every use.
+- Without `max-age`, the `Expires` header sets the lifetime (`Expires` minus
+  the response's `Date`). An `Expires` in the past, or one that is not a valid
+  date (such as `0` or `-1`), means the response is already expired: it is
+  stored, but revalidated before use. `max-age` wins over `Expires`, and
+  `defaultTtl` applies only when neither is present.
 - Expired entries are revalidated with `If-None-Match` / `If-Modified-Since`;
-  a `304 Not Modified` returns the cached data (status 200) and renews the entry.
+  a `304 Not Modified` returns the cached data (status 200) and renews the
+  entry. A 304 without its own `Cache-Control`/`Expires` keeps the stored
+  response's rules (a `no-cache` entry is revalidated again next time).
 - With `enableStaleWhileRevalidate`, an expired entry younger than `staleTtl`
-  is returned immediately and refreshed in the background.
+  is returned immediately and refreshed in the background. Entries stored
+  with `no-cache` or `must-revalidate` are excluded: they are always
+  revalidated before use.
 - If the network fails (`NetworkException`), an entry younger than `staleTtl`
-  is served instead of the error.
+  is served instead of the error. With a retry interceptor (as installed by
+  `ApiBuilder`), this happens after the retries are used up.
 - `forceCache` serves any cached entry regardless of age; `bypassCache` skips
   cache lookups.
+- A failing `CacheStore` never fails a request: a read error is treated as a
+  miss and a write error is ignored.
+- `CacheMetrics` counts each request once: a revalidation is a hit when the
+  server answers 304 and a miss when it sends new content.
 
 **Cache keys** are built from the method, path, and query parameters, not
-headers. If responses depend on the user (e.g. `Authorization`), clear the
-store on logout (`await store.clear()`) or include the user in a custom
-`keyBuilder`, which receives the method and the path with its sorted query
-string:
+headers, with `CacheKeyGenerator.generate`. Requests with different query
+parameters never share an entry. To invalidate one entry, for example after
+a mutation, delete its key:
+
+```dart
+await api.request<Map<String, dynamic>>(ApiRequest(
+  path: '/posts/1',
+  method: HttpMethod.put,
+  body: post.toJson(),
+));
+await store.delete(CacheKeyGenerator.generate('GET', '/posts', {'userId': 1}));
+```
+
+Pass the same `path` and `queryParameters` as the cached request (`null`
+values are ignored, as in the URL).
+
+If responses depend on the user (e.g. `Authorization`), clear the store on
+logout (`await store.clear()`) or include the user in a custom `keyBuilder`,
+which receives the method and the path with its sorted query string:
 
 ```dart
 CacheConfig(
@@ -262,6 +326,8 @@ CacheConfig(
   keyBuilder: (method, url) => '$currentUserId:$method:$url',
 );
 ```
+
+With a custom `keyBuilder`, build keys the same way to delete an entry.
 
 `MemoryCacheStore` keeps response objects in memory as-is. Don't mutate
 `response.data` if the response may be cached. Implement `CacheStore` for
@@ -282,10 +348,29 @@ const loggerConfig = LoggerConfig(
 );
 ```
 
-`maskedKeys` are matched case-insensitively against request and response
-header names and against keys at any depth of map/JSON bodies, in every
-format including the curl command. Values that cannot be JSON-encoded are
-logged with `toString()` and never fail the request.
+`maskedKeys` are matched against request and response header names, keys at
+any depth of map/JSON bodies, and query parameter names (both
+`queryParameters` and a query string in the path), in every format including
+the curl command.
+
+Keys are normalised before they are compared: both the configured keys and
+the actual keys are lower-cased, and `_`, `-` and whitespace are removed. So
+`access_token` also masks `accessToken`, `access-token`, and `ACCESS_TOKEN`.
+The defaults are `authorization`, `proxy-authorization`, `cookie`,
+`set-cookie`, `x-api-key`, `api_key`, `password`, `token`, `access_token`,
+`refresh_token`, `id_token`, `secret`, and `client_secret`. Setting
+`maskedKeys` replaces the defaults, so include them if you only want to add
+keys.
+
+Values that cannot be JSON-encoded are logged with `toString()` and never
+fail the request.
+
+The curl command uses the full URL (base URL plus path), so it can be pasted
+into a terminal once masked values are filled in. With `LogFormat.json` it is
+the `curl` field of the request record, so every line of output is valid JSON.
+
+With a retry interceptor, every attempt is logged: its request, its response
+(for HTTP errors), and its error, once and in order.
 
 Pretty-printing and masking large bodies costs CPU on the calling isolate.
 In production, prefer `LogLevel.error`, or set `printRequestBody` /
@@ -295,19 +380,20 @@ Sample output (`LogFormat.pretty`, colors off):
 
 ```
 ┌── Request ──────────────────────────────────────────────────
-│ GET /users/1
+│ GET /users/1?fields=name&api_key=***
 ├─ Headers:
 │   Accept: application/json
 │   Authorization: ***
 └────────────────────────────────────────────────────────────
-curl -X GET -H "Accept: application/json" -H "Authorization: ***" "/users/1"
+curl -X GET -H "Accept: application/json" -H "Authorization: ***" "https://api.example.com/users/1?fields=name&api_key=***"
 ┌── Response ─────────────────────────────────────────────────
 │ Status: 200 OK
 │ Duration: 142ms
 ├─ Body:
 │   {
 │     "id": 1,
-│     "name": "John Doe"
+│     "name": "John Doe",
+│     "accessToken": "***"
 │   }
 └────────────────────────────────────────────────────────────
 ```
@@ -334,7 +420,10 @@ try {
 } on NetworkException {
   // DNS, socket, TLS, connection errors
 } on SerializationException {
-  // body could not be encoded, or response data is not the requested type
+  // body could not be encoded or decoded (malformed JSON), or response data
+  // is not the requested type
+} on ConfigurationException {
+  // invalid URL, or the adapter was closed
 } on ApiException {
   // anything else from api_plus
 }
@@ -342,6 +431,11 @@ try {
 
 `TimeoutException` has the same name as `dart:async`'s. If a file imports
 both, hide one: `import 'dart:async' hide TimeoutException;`.
+
+`RetryLimitExceededException` and `CacheException` are never thrown by
+api_plus itself: exhausted retries return the last attempt's error, and cache
+failures fall back to the network. They are available for your own
+interceptors, strategies, and stores.
 
 ## Using with Retrofit
 
@@ -361,7 +455,10 @@ adapter.close();
 ```
 
 Retrofit code keeps receiving Dio types (`Response`, `DioException`); the
-api_plus interceptors run inside Dio's interceptor chain.
+api_plus interceptors run inside Dio's interceptor chain, in the same order as
+with `ApiBuilder` (retry → cache → logger → custom). As with the other
+adapters, `onResponse` runs for error statuses too, and after retries the
+`DioException` is the last attempt's (its status and body).
 
 ## Metrics
 
@@ -373,7 +470,9 @@ final retry = RetryInterceptor(config: const RetryConfig(enableMetrics: true));
 final cache = CacheInterceptor(
   config: CacheConfig(store: MemoryCacheStore(), enableMetrics: true),
 );
-final api = ApiBuilder(baseUrl).addInterceptor(cache).addInterceptor(retry).build();
+// Retry before cache, as ApiBuilder does: stale entries are served only
+// after the retries are used up.
+final api = ApiBuilder(baseUrl).addInterceptor(retry).addInterceptor(cache).build();
 
 print(retry.metrics);  // RetryMetrics(total: 3, success: 1, failed: 0, ...)
 print(cache.metrics.hitRate);
@@ -386,7 +485,7 @@ Interceptors created by `withRetry`/`withCache` can be found with
 
 | Interface | Purpose |
 |-----------|---------|
-| `ApiAdapter` | Support another HTTP client |
+| `ApiAdapter` + `InterceptorPipeline` | Support another HTTP client: implement the raw call and pass it to `runPipeline`, and retry, caching (including stale-while-revalidate), and logging work as with the built-in adapters |
 | `ApiInterceptor` | Custom request/response/error handling |
 | `CacheStore` | Custom cache backend |
 | `RetryStrategy` | Custom retry decisions and delays |
@@ -418,6 +517,48 @@ Flutter apps still need network access at the OS level:
 - `CacheMetrics.evictions` is recorded automatically for `MemoryCacheStore`
   only; custom stores call `metrics.recordEviction()` themselves.
 
+## Upgrading from 0.0.3
+
+For `0.0.x` versions, a caret constraint only allows patch-identical
+releases (`^0.0.3` means `>=0.0.3 <0.0.4`), so update your constraint to
+`^0.0.4`.
+
+0.0.4 is a bug-fix release: no public API is removed or changed (there are two
+small additions, listed below), and the fixes make the code do what the
+documentation already described. Most apps need no code changes. See the [CHANGELOG](CHANGELOG.md) for the full list. Check these if
+you rely on the old behavior:
+
+- **Built-in interceptor order** is now retry → cache → logger → custom (was
+  cache → retry → …) in `ApiBuilder` and `RetrofitAdapter`, so failed
+  requests are retried before stale cache entries are served. Code that reads
+  `api.interceptors[0]` should use `whereType<…>()` instead.
+- **Cache keys changed format** (they now come from
+  `CacheKeyGenerator.generate`). Entries in a persistent `CacheStore` written
+  by 0.0.3 are not found and are fetched again once.
+- **`Expires` is honored**, so responses that were cached for `defaultTtl`
+  despite an expired `Expires` header are now revalidated.
+- **Retry-After:** a request is no longer retried when the server asks for a
+  delay longer than `maxDelay` (or beyond `maxElapsedDuration`); the 429/503
+  error is returned immediately.
+- **DioAdapter/RetrofitAdapter:** malformed JSON is a
+  `SerializationException` and an invalid URL a `ConfigurationException`
+  (both were retryable `NetworkException`s). An empty body is `null` in
+  `ApiResponse.data` (was `''`).
+- **RetrofitAdapter** rejects with the last attempt's `DioException` and runs
+  `onResponse` for error statuses.
+- **`close()`** waits for in-flight `HttpAdapter` requests; requests started
+  after `close()` fail with `ConfigurationException`.
+- **Logging** masks more: camelCase/kebab-case spellings of `maskedKeys`,
+  `id_token`, and query parameters. Curl commands use the full URL, and with
+  `LogFormat.json` the curl command is a field of the request record instead
+  of a separate (non-JSON) line. With retries, each attempt's error is logged
+  once (the first was missing and the last was logged twice).
+- **Cached responses** report the current request as `response.request`
+  (was the request that filled the cache).
+- **New:** `InterceptorPipeline` is exported (as its documentation already
+  showed), and `ApiRequest.copyWithout` / `ApiResponse.copyWithout` remove
+  nullable fields, which `copyWith` cannot.
+
 ## Upgrading from 0.0.2
 
 For `0.0.x` versions, a caret constraint only allows patch-identical
@@ -431,7 +572,7 @@ releases (`^0.0.2` means `>=0.0.2 <0.0.3`), so update your constraint to
 - `request<Map<String, dynamic>>` and other typed calls now work; before,
   they threw a `TypeError`.
 - With `HttpAdapter`, non-2xx responses now go through `onError`, so they are
-  retried and can be served from stale cache.
+  retried. (The stale-cache fallback applies to network failures only.)
 - `HttpAdapter` returns non-JSON content types (e.g. `text/plain`) as a
   `String` instead of attempting to JSON-decode them.
 - Non-`ApiException` errors thrown by your interceptors are no longer wrapped

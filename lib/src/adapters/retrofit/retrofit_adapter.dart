@@ -9,6 +9,7 @@ import '../../core/api_cancel_token.dart';
 import '../../core/api_request.dart';
 import '../../core/api_response.dart';
 import '../../core/internal_keys.dart';
+import '../../core/request_url.dart';
 import '../../exceptions/api_exception.dart';
 import '../../interfaces/api_interceptor.dart';
 import '../../interceptors/cache_interceptor.dart';
@@ -48,7 +49,9 @@ class RetrofitAdapter {
   /// Creates a [RetrofitAdapter] with the given configuration.
   ///
   /// Interceptors are built from the provided configs in the order:
-  /// cache → retry → logger → custom interceptors.
+  /// retry → cache → logger → custom interceptors, as with `ApiBuilder`.
+  /// Retry comes first so that a failed request is retried before the
+  /// cache serves a stale entry.
   RetrofitAdapter({
     required String baseUrl,
     Map<String, String> defaultHeaders = const {},
@@ -72,11 +75,11 @@ class RetrofitAdapter {
     CacheConfig? cacheConfig,
   }) {
     final result = <ApiInterceptor>[];
-    if (cacheConfig != null) {
-      result.add(CacheInterceptor(config: cacheConfig));
-    }
     if (retryConfig != null) {
       result.add(RetryInterceptor(config: retryConfig));
+    }
+    if (cacheConfig != null) {
+      result.add(CacheInterceptor(config: cacheConfig));
     }
     if (loggerConfig != null) {
       result.add(LoggerInterceptor(config: loggerConfig));
@@ -152,17 +155,63 @@ class _RetrofitBridgeInterceptor extends dio.Interceptor {
       }
 
       _applyToOptions(original, apiRequest, options);
+
+      final invalidUrl = _validateUrl(options);
+      if (invalidUrl != null) {
+        // Reported like DioAdapter: through onError (so it is logged), as a
+        // ConfigurationException that is not retried.
+        handler.reject(
+          dio.DioException(
+            requestOptions: options,
+            error: invalidUrl,
+            stackTrace: invalidUrl.stackTrace,
+            type: dio.DioExceptionType.unknown,
+          ),
+          true,
+        );
+        return;
+      }
       handler.next(options);
     } catch (e, stackTrace) {
-      handler.reject(
-        dio.DioException(
-          requestOptions: options,
-          error: e,
-          stackTrace: stackTrace,
-          type: dio.DioExceptionType.unknown,
-        ),
+      handler.reject(_interceptorFailure(options, e, stackTrace));
+    }
+  }
+
+  /// Returns a [ConfigurationException] if Dio cannot build a valid URL for
+  /// [options], so the error is not reported as a (retryable) network error.
+  static ConfigurationException? _validateUrl(dio.RequestOptions options) {
+    try {
+      if (looksLikeAbsoluteUrl(options.path)) parseAbsoluteUrl(options.path);
+      options.uri;
+      return null;
+    } on FormatException catch (e, stackTrace) {
+      return ConfigurationException(
+        message: 'Invalid request URL: ${e.message}',
+        error: e,
+        stackTrace: stackTrace,
       );
     }
+  }
+
+  /// Dio errors that wrap an error thrown by an api_plus interceptor (e.g.
+  /// a `StateError` from a bug). Retries rethrow the original error, so it
+  /// propagates unchanged instead of being retried as a network error.
+  static final Expando<bool> _interceptorFailures =
+      Expando<bool>('apiPlusInterceptorFailure');
+
+  static dio.DioException _interceptorFailure(
+    dio.RequestOptions options,
+    Object error,
+    StackTrace stackTrace,
+  ) {
+    final failure = dio.DioException(
+      requestOptions: options,
+      error: error,
+      stackTrace: stackTrace,
+      type: dio.DioExceptionType.unknown,
+    );
+    if (error is! ApiException) _interceptorFailures[failure] = true;
+    return failure;
   }
 
   /// Writes the changes interceptors made to [modified] back into [options].
@@ -227,26 +276,29 @@ class _RetrofitBridgeInterceptor extends dio.Interceptor {
     dio.ResponseInterceptorHandler handler,
   ) async {
     try {
-      ApiResponse<dynamic> apiResponse = _toApiResponse(
-        response,
-        _dioOptionsToApiRequest(response.requestOptions),
+      final apiResponse = await _runResponseChain(
+        _toApiResponse(
+          response,
+          _dioOptionsToApiRequest(response.requestOptions),
+        ),
       );
-
-      for (final interceptor in _apiInterceptors) {
-        apiResponse = await interceptor.onResponse(apiResponse);
-      }
-
       handler.resolve(_toDioResponse(apiResponse, response.requestOptions));
     } catch (e, stackTrace) {
       handler.reject(
-        dio.DioException(
-          requestOptions: response.requestOptions,
-          error: e,
-          stackTrace: stackTrace,
-          type: dio.DioExceptionType.unknown,
-        ),
+        _interceptorFailure(response.requestOptions, e, stackTrace),
       );
     }
+  }
+
+  /// Runs the api_plus `onResponse` chain on [response].
+  Future<ApiResponse<dynamic>> _runResponseChain(
+    ApiResponse<dynamic> response,
+  ) async {
+    var current = response;
+    for (final interceptor in _apiInterceptors) {
+      current = await interceptor.onResponse(current);
+    }
+    return current;
   }
 
   @override
@@ -263,7 +315,42 @@ class _RetrofitBridgeInterceptor extends dio.Interceptor {
   ) async {
     try {
       final apiRequest = _dioOptionsToApiRequest(err.requestOptions);
-      ApiException apiException = _mapDioError(err, apiRequest);
+      ApiException apiException;
+
+      final rawResponse = err.response;
+      if (err.type == dio.DioExceptionType.badResponse && rawResponse != null) {
+        // Like the other adapters, error statuses go through onResponse
+        // first, then (unless an interceptor turned them into a success)
+        // through onError as a ServerException.
+        final converted = _toApiResponse(rawResponse, apiRequest);
+        try {
+          final response = await _runResponseChain(converted);
+          if (response.isSuccessful) {
+            handler.resolve(_toDioResponse(response, err.requestOptions));
+            return;
+          }
+          apiException = serverExceptionFor(
+            apiRequest,
+            response,
+            // Keep Dio's own error unless an interceptor changed the
+            // response, so Retrofit callers see what interceptors see.
+            error: identical(response, converted)
+                ? err
+                : dio.DioException.badResponse(
+                    statusCode: response.statusCode,
+                    requestOptions: err.requestOptions,
+                    response: _toDioResponse(response, err.requestOptions),
+                  ),
+            stackTrace: err.stackTrace,
+          );
+        } on ApiException catch (e) {
+          // As in the other adapters, an ApiException thrown by onResponse
+          // goes through onError.
+          apiException = e;
+        }
+      } else {
+        apiException = _mapDioError(err, apiRequest);
+      }
 
       // Re-sends a request through this client's full pipeline. Failures
       // are thrown as ApiException so interceptors (e.g. retry) handle them.
@@ -274,7 +361,14 @@ class _RetrofitBridgeInterceptor extends dio.Interceptor {
           );
           return _toApiResponse(retryResponse, request);
         } on dio.DioException catch (e) {
-          throw _mapDioError(e, request);
+          final cause = e.error;
+          if (cause != null && (_interceptorFailures[e] ?? false)) {
+            // An interceptor bug, not a network error: propagate it as is.
+            Error.throwWithStackTrace(cause, e.stackTrace);
+          }
+          // The error the attempt's own pipeline ended with (as the other
+          // adapters do), so interceptors see one error object per attempt.
+          throw _pipelineErrors[e] ?? _mapDioError(e, request);
         }
       }
 
@@ -303,17 +397,36 @@ class _RetrofitBridgeInterceptor extends dio.Interceptor {
         );
         return;
       }
-      handler.reject(err);
+      final dioError = _toDioError(apiException, err);
+      _pipelineErrors[dioError] = apiException;
+      handler.reject(dioError);
     } catch (e, stackTrace) {
-      handler.reject(
-        dio.DioException(
-          requestOptions: err.requestOptions,
-          error: e,
-          stackTrace: stackTrace,
-          type: dio.DioExceptionType.unknown,
-        ),
+      handler.reject(_interceptorFailure(err.requestOptions, e, stackTrace));
+    }
+  }
+
+  /// The api_plus error each rejected Dio error stands for.
+  static final Expando<ApiException> _pipelineErrors =
+      Expando<ApiException>('apiPlusPipelineError');
+
+  /// The Dio error to reject with for the final [error] of the pipeline:
+  /// the last attempt's [dio.DioException] (not the first one's), or one
+  /// built from the error's response, falling back to [original].
+  static dio.DioException _toDioError(
+    ApiException error,
+    dio.DioException original,
+  ) {
+    final cause = error.error;
+    if (cause is dio.DioException) return cause;
+    final response = error.response;
+    if (response != null) {
+      return dio.DioException.badResponse(
+        statusCode: response.statusCode,
+        requestOptions: original.requestOptions,
+        response: _toDioResponse(response, original.requestOptions),
       );
     }
+    return original;
   }
 
   /// Builds options for re-sending [request], keeping the Dio-specific
@@ -335,26 +448,35 @@ class _RetrofitBridgeInterceptor extends dio.Interceptor {
     );
   }
 
+  /// Converts a Dio response for api_plus interceptors. An empty body is
+  /// `null`, as with the other adapters.
   static ApiResponse<dynamic> _toApiResponse(
     dio.Response<dynamic> response,
     ApiRequest request,
   ) {
-    return ApiResponse<dynamic>(
-      data: response.data,
+    final data = response.data;
+    final empty = data is String && data.isEmpty;
+    final converted = ApiResponse<dynamic>(
+      data: empty ? null : data,
       statusCode: response.statusCode ?? 200,
       headers: Map<String, List<String>>.of(response.headers.map),
       statusMessage: response.statusMessage,
       isRedirect: response.isRedirect,
       request: request,
     );
+    if (empty) markEmptyBody(converted);
+    return converted;
   }
 
+  /// Converts back for Dio and Retrofit code, which keep receiving exactly
+  /// what Dio returned for an empty body (`''`).
   static dio.Response<dynamic> _toDioResponse(
     ApiResponse<dynamic> response,
     dio.RequestOptions options,
   ) {
+    final data = response.data;
     return dio.Response<dynamic>(
-      data: response.data,
+      data: data == null && isEmptyBody(response) ? '' : data,
       statusCode: response.statusCode,
       statusMessage: response.statusMessage,
       requestOptions: options,
@@ -380,16 +502,23 @@ class _RetrofitBridgeInterceptor extends dio.Interceptor {
       connectTimeout: options.connectTimeout,
       receiveTimeout: options.receiveTimeout,
       sendTimeout: options.sendTimeout,
-      extra: options.extra,
+      extra: {...options.extra, baseUrlExtraKey: options.baseUrl},
       cancelToken: _linkCancelToken(options.cancelToken),
     );
   }
+
+  /// The [ApiCancelToken] mirroring each Dio token, so a long-lived Dio
+  /// token gets one listener rather than one per request.
+  static final Expando<ApiCancelToken> _linkedTokens =
+      Expando<ApiCancelToken>('apiPlusLinkedCancelToken');
 
   /// Mirrors a Dio [token] as an [ApiCancelToken], so api_plus interceptors
   /// (e.g. a pending retry delay) react to Retrofit's `@CancelRequest`.
   static ApiCancelToken? _linkCancelToken(dio.CancelToken? token) {
     if (token == null) return null;
-    final apiToken = ApiCancelToken();
+    final existing = _linkedTokens[token];
+    if (existing != null) return existing;
+    final apiToken = _linkedTokens[token] = ApiCancelToken();
     if (token.isCancelled) {
       apiToken.cancel(token.cancelError?.error);
     } else {
@@ -443,20 +572,18 @@ class _RetrofitBridgeInterceptor extends dio.Interceptor {
           error: e,
         );
       case dio.DioExceptionType.badResponse:
-        final respHeaders = <String, List<String>>{};
-        e.response?.headers.map.forEach((key, value) {
-          respHeaders[key] = value;
-        });
+        final response = e.response;
+        if (response != null) {
+          return serverExceptionFor(
+            request,
+            _toApiResponse(response, request),
+            error: e,
+          );
+        }
         return ServerException.fromResponse(
           message: e.message ?? 'Server error',
           request: request,
-          response: ApiResponse<dynamic>(
-            data: e.response?.data,
-            statusCode: e.response?.statusCode ?? 500,
-            headers: respHeaders,
-            statusMessage: e.response?.statusMessage,
-            request: request,
-          ),
+          response: ApiResponse<dynamic>(statusCode: 500, request: request),
           error: e,
         );
       case dio.DioExceptionType.cancel:
@@ -465,10 +592,30 @@ class _RetrofitBridgeInterceptor extends dio.Interceptor {
           request: request,
           error: e,
         );
-      case dio.DioExceptionType.connectionError:
-      case dio.DioExceptionType.badCertificate:
       case dio.DioExceptionType.unknown:
       case dio.DioExceptionType.transformTimeout:
+        final cause = e.error;
+        // Thrown by an api_plus interceptor or by URL validation.
+        if (cause is ApiException) return cause;
+        // URLs are validated before sending, so a FormatException comes
+        // from decoding the response body (e.g. malformed JSON).
+        if (cause is FormatException) {
+          final response = e.response;
+          return SerializationException(
+            message: 'Response body could not be decoded: $cause',
+            request: request,
+            response:
+                response == null ? null : _toApiResponse(response, request),
+            error: e,
+          );
+        }
+        return NetworkException(
+          message: e.message ?? 'Network error',
+          request: request,
+          error: e,
+        );
+      case dio.DioExceptionType.connectionError:
+      case dio.DioExceptionType.badCertificate:
         return NetworkException(
           message: e.message ?? 'Network error',
           request: request,

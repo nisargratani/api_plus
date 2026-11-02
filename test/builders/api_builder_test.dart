@@ -62,7 +62,7 @@ void main() {
       );
     });
 
-    test('interceptor ordering is cache, retry, logger, custom', () {
+    test('interceptor ordering is retry, cache, logger, custom', () {
       final custom = _CustomInterceptor();
       final adapter = ApiBuilder('https://api.example.com')
           .withCache(CacheConfig(store: MemoryCacheStore()))
@@ -71,8 +71,8 @@ void main() {
           .addInterceptor(custom)
           .build();
 
-      expect(adapter.interceptors[0], isA<CacheInterceptor>());
-      expect(adapter.interceptors[1], isA<RetryInterceptor>());
+      expect(adapter.interceptors[0], isA<RetryInterceptor>());
+      expect(adapter.interceptors[1], isA<CacheInterceptor>());
       expect(adapter.interceptors[2], isA<LoggerInterceptor>());
       expect(adapter.interceptors[3], custom);
     });

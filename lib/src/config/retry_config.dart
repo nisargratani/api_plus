@@ -57,13 +57,20 @@ class RetryConfig {
 
   /// Maximum delay allowed between any two retry attempts.
   ///
-  /// Caps the calculated delay to prevent extremely long waits.
+  /// Caps the calculated backoff delay to prevent extremely long waits. No
+  /// wait ever exceeds it: if a `Retry-After` header asks for a longer
+  /// delay (see [respectRetryAfter]), the request is not retried and the
+  /// error is returned immediately.
   final Duration maxDelay;
 
   /// Maximum total duration allowed for all retry attempts.
   ///
   /// If the total elapsed time since the first attempt exceeds this
-  /// duration, no more retries are attempted. Set to `null` for no limit.
+  /// duration, no more retries are attempted. A retry whose delay would end
+  /// after this duration is not started either: the error is returned
+  /// immediately instead of waiting. Set to `null` for no limit.
+  ///
+  /// Ignored when a [customStrategy] is set.
   final Duration? maxElapsedDuration;
 
   /// The backoff strategy to use for calculating delays.
@@ -103,8 +110,13 @@ class RetryConfig {
 
   /// Whether to respect the `Retry-After` header in the response.
   ///
-  /// When `true`, the delay from the Retry-After header takes precedence
-  /// over the calculated backoff delay if it is larger.
+  /// When `true`, the delay from the Retry-After header (seconds or an
+  /// HTTP date) takes precedence over the calculated backoff delay if it is
+  /// larger. If that delay exceeds [maxDelay], or would end after
+  /// [maxElapsedDuration], the request is not retried: the error (with the
+  /// `retry-after` header in `error.response`) is returned right away
+  /// rather than waiting longer than configured or retrying before the
+  /// server is ready.
   final bool respectRetryAfter;
 
   /// Optional custom retry strategy.

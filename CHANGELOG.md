@@ -1,3 +1,158 @@
+## 0.0.4
+
+A bug-fix release based on an external QA report (issues API_PLUS-01 to
+API_PLUS-19, plus the report's other observations). The changes make the code
+do what the README and API docs already describe; no public API is removed,
+renamed, or changed (two small additions are listed under "New"). Most apps
+need no code changes; see "Behavior changes" below. Note that `^0.0.3` does not allow
+`0.0.4`; update your constraint to `^0.0.4`.
+
+### Bug fixes
+
+- **Logger: tokens in camelCase were logged in plain text** (API_PLUS-01).
+  `maskedKeys` are now compared after normalisation (lower-cased, without
+  `_`, `-` and whitespace), so `access_token` also masks `accessToken`,
+  `access-token` and `ACCESS_TOKEN`. `id_token` was added to the defaults.
+- **`Retry-After` could exceed `maxDelay` and `maxElapsedDuration`**
+  (API_PLUS-02). A `Retry-After: 3600` made a request wait an hour per retry.
+  Now no wait exceeds `maxDelay` or ends after `maxElapsedDuration`: the
+  request is not retried and the 429/503 is returned immediately.
+- **`DioAdapter`: typed requests to empty (204) responses threw**
+  (API_PLUS-03). An empty body is now `null`, as with `HttpAdapter`, so
+  `request<Map<String, dynamic>>` works for a `DELETE` that returns 204.
+- **`DioAdapter`/`RetrofitAdapter`: malformed JSON and invalid URLs were
+  retryable `NetworkException`s** (API_PLUS-04). A malformed body is now a
+  `SerializationException` and an invalid URL a `ConfigurationException`;
+  neither is retried, and no request is sent for an invalid URL.
+- **Interceptor errors during a retry were wrapped and retried**
+  (API_PLUS-05). Non-`ApiException` errors (e.g. a `StateError`) thrown by an
+  interceptor while a request is retried are now propagated unchanged and
+  not retried, as documented (also with `RetrofitAdapter`).
+- **`RetrofitAdapter` rethrew the first attempt's error** (API_PLUS-06).
+  After retries, the `DioException` now carries the last attempt's status
+  and body.
+- **`RetrofitAdapter` skipped `onResponse` for error statuses**
+  (API_PLUS-07). Interceptors now see every response, as with the other
+  adapters.
+- **`HttpAdapter.close()` aborted in-flight requests** (API_PLUS-08).
+  `close()` now lets them finish and closes the client afterwards;
+  `close(force: true)` aborts them.
+- **Cache entries could be shared by different URLs** (API_PLUS-09). The
+  default key used `Map.toString()`, so `{q: 'a', r: 'b'}` and
+  `{q: 'a, r: b'}` collided and the second request got the first one's
+  data.
+- **`no-cache` responses were served without revalidation** when
+  `enableStaleWhileRevalidate` was on (API_PLUS-10). They (and
+  `must-revalidate` responses) are now revalidated before use. A `304`
+  without its own `Cache-Control`/`Expires` now keeps the stored response's
+  rules instead of renewing the entry for `defaultTtl`.
+- **The `Expires` header was ignored** (API_PLUS-11). Responses with an
+  expired `Expires` (e.g. `Thu, 01 Jan 1970 00:00:00 GMT`) were cached for
+  `defaultTtl` (7 days). `Expires` now sets the lifetime when there is no
+  `max-age`; invalid values such as `0` or `-1` mean "already expired".
+  `max-age` still wins. `CacheEntry.isExpired` is now true at `expiresAt`, so
+  zero-lifetime entries are always expired.
+- **With cache + retry, a network error served stale data instead of
+  retrying** (API_PLUS-12). The stale entry is now served only after the
+  retry interceptor gives up; offline fallback still works.
+- **Query parameters were never masked in logs** (API_PLUS-13). `api_key`,
+  `access_token`, etc. in `queryParameters` or in a query string in the path
+  are now masked in every format and in the curl command.
+- **A failing `CacheStore` failed every request** (API_PLUS-14). A store
+  read error is now treated as a miss and a write error is skipped; the
+  request goes to the network.
+- **A long-lived `ApiCancelToken` kept every request made with it in
+  memory** (API_PLUS-15), including request bodies, until it was cancelled.
+  Completed requests are now released. `HttpAdapter` also no longer keeps
+  the last request alive through its idle connection.
+- **`CacheKeyGenerator` did not produce the cache interceptor's keys**
+  (API_PLUS-16). The interceptor now uses it, so one entry can be
+  invalidated with `store.delete(CacheKeyGenerator.generate(...))`.
+- **`CacheMetrics` counted a `304` revalidation twice** (API_PLUS-17), as a
+  miss and a hit. A revalidation now counts once: a hit on 304, a miss on new
+  content. Retry attempts and background refreshes are not counted again.
+- **`HttpDateParser` accepted impossible dates** (API_PLUS-18) such as
+  `31 Feb` or `25:61:61`, rolling them over. They now return `null`.
+- **`HttpAdapter` sent a malformed absolute URL to the base URL**
+  (API_PLUS-19), e.g. `http://[::1/users` became
+  `<base>/http://%5B::1/users`. It now throws `ConfigurationException`
+  without sending anything.
+
+### Other fixes
+
+These were noted in the same QA report:
+
+- **Logger with retries:** the first attempt's error was never logged and the
+  last one was logged twice. Each attempt's error is now logged once, in
+  order (`RetryInterceptor` lets the logger see the first error before it
+  retries).
+- **Curl commands** used the relative path, so they could not be pasted;
+  they now use the full URL. With `LogFormat.json`, the curl command was a
+  separate non-JSON line; it is now the `curl` field of the request record.
+- **Cached responses** reported the request that filled the cache (old
+  headers, extras, and cancel token) as `response.request`; they now report
+  the current request. Stale-while-revalidate responses no longer expose the
+  internal `_apiPlusRevalidate` extra.
+- **`InterceptorPipeline`** was documented for custom adapters but not
+  exported; it is now part of the public API.
+- **`ApiRequest.copyWith` / `ApiResponse.copyWith` could not clear nullable
+  fields.** `copyWith` is unchanged (`null` keeps the value); the new
+  `copyWithout` removes fields, e.g. `request.copyWithout(body: true)`.
+- **Docs:** `RetryLimitExceededException` and `CacheException` are now
+  documented as not thrown by api_plus (they were described as "thrown
+  when…"), and the 0.0.3 entry below no longer claims that 5xx/429
+  responses are served from stale cache (only network failures are).
+
+### New
+
+- `InterceptorPipeline` is exported, for custom `ApiAdapter`s.
+- `ApiRequest.copyWithout` and `ApiResponse.copyWithout`.
+
+### Behavior changes
+
+- **Built-in interceptor order** is now retry → cache → logger → custom in
+  `ApiBuilder` and `RetrofitAdapter` (was cache → retry → logger → custom),
+  so retries run before the stale-cache fallback. If you build interceptor
+  lists yourself, put `RetryInterceptor` before `CacheInterceptor`.
+- **`DioAdapter`/`RetrofitAdapter`:** malformed JSON responses throw
+  `SerializationException` and invalid URLs `ConfigurationException`
+  (previously retryable `NetworkException`s). `ApiResponse.data` is `null`
+  for an empty body (was `''`); Retrofit callers still receive what Dio
+  returns.
+- **`RetrofitAdapter`** rejects with the last attempt's `DioException` after
+  retries, and runs `onResponse` interceptors for error statuses.
+- **`close()`:** `HttpAdapter.close()` waits for in-flight requests (use
+  `close(force: true)` to abort them). On `HttpAdapter` and `DioAdapter`,
+  requests and retries started after `close()` fail with a
+  `ConfigurationException` (not retried) instead of a retried
+  `NetworkException`.
+- **Retry-After:** requests are no longer retried when `Retry-After` asks
+  for more than `maxDelay`, or for a wait that would end after
+  `maxElapsedDuration`.
+- **Caching:** `Expires` is honored; `no-cache` and `must-revalidate`
+  entries are never served by stale-while-revalidate; a 304 without
+  freshness headers keeps the stored rules.
+- **Cache keys changed format.** Default keys now come from
+  `CacheKeyGenerator.generate` (sorted JSON query parameters, `null` values
+  ignored). Entries a persistent custom store wrote with 0.0.3 are missed
+  once and fetched again. `CacheConfig.keyBuilder` is unchanged.
+- **Logging masks more:** normalised key matching (camelCase, kebab-case,
+  upper case), `id_token` in the defaults, and query parameters.
+- **Logging output:** curl commands use the full URL; with `LogFormat.json`
+  the curl command is a `curl` field instead of a separate line; with
+  retries, each attempt's error is logged exactly once.
+- **Cached responses** report the current request as `response.request`.
+- **`CacheMetrics`:** revalidations, retry attempts and background
+  refreshes are each counted once, so `totalRequests` matches the number of
+  requests.
+
+### Tests
+
+- `test/qa_0_0_4_test.dart`: one regression test per issue (named after its
+  ID), plus tests for the other fixes, against a real local server. The
+  cancel-token test checks with forced garbage collection that completed
+  requests are released.
+
 ## 0.0.3
 
 This release fixes several bugs that affected real applications and adds
@@ -12,8 +167,8 @@ below. Note that `^0.0.2` does not allow `0.0.3`; update your constraint to
   retry requests. Responses are now converted to `ApiResponse<T>`; data of
   the wrong type throws a `SerializationException` with a clear message.
 - **`HttpAdapter`: HTTP error statuses reach `onError`.** Non-2xx responses
-  skipped the error interceptors, so 5xx/429 responses were never retried and
-  never served from stale cache.
+  skipped the error interceptors, so 5xx/429 responses were never retried.
+  (The stale-cache fallback applies to network failures only.)
 - **`DioAdapter`/`RetrofitAdapter`: ETag revalidation works.** A `304 Not
   Modified` was thrown as a `ServerException` instead of serving the cached
   data.

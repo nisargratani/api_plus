@@ -192,23 +192,44 @@ void main() {
       expect(keys.single, 'GET /users?filter=a+b&page=2');
     });
 
-    test('records a miss when adding conditional headers', () async {
-      final store = MemoryCacheStore();
-      await store.put(
-        'GET:/x',
-        CacheEntry(
-          response: const ApiResponse<String>(data: 'v', statusCode: 200),
-          cachedAt: DateTime.now().subtract(const Duration(hours: 1)),
-          expiresAt: DateTime.now().subtract(const Duration(minutes: 1)),
-          eTag: '"1"',
-        ),
-      );
-      final interceptor = CacheInterceptor(
-        config: CacheConfig(store: store, enableMetrics: true),
-      );
+    test('counts a revalidation once its outcome is known', () async {
+      Future<CacheInterceptor> withExpiredEntry() async {
+        final store = MemoryCacheStore();
+        await store.put(
+          'GET:/x',
+          CacheEntry(
+            response: const ApiResponse<String>(data: 'v', statusCode: 200),
+            cachedAt: DateTime.now().subtract(const Duration(hours: 1)),
+            expiresAt: DateTime.now().subtract(const Duration(minutes: 1)),
+            eTag: '"1"',
+          ),
+        );
+        return CacheInterceptor(
+          config: CacheConfig(store: store, enableMetrics: true),
+        );
+      }
 
-      await interceptor.onRequest(const ApiRequest(path: '/x'));
+      // New content: one miss.
+      var interceptor = await withExpiredEntry();
+      var sent = await interceptor.onRequest(const ApiRequest(path: '/x'))
+          as ApiRequest;
+      expect(sent.headers['If-None-Match'], '"1"');
+      expect(interceptor.metrics.totalRequests, 0);
+      await interceptor.onResponse(
+        ApiResponse<String>(data: 'new', statusCode: 200, request: sent),
+      );
       expect(interceptor.metrics.misses, 1);
+      expect(interceptor.metrics.hits, 0);
+
+      // Not modified: one hit.
+      interceptor = await withExpiredEntry();
+      sent = await interceptor.onRequest(const ApiRequest(path: '/x'))
+          as ApiRequest;
+      await interceptor.onResponse(
+        ApiResponse<String>(statusCode: 304, request: sent),
+      );
+      expect(interceptor.metrics.hits, 1);
+      expect(interceptor.metrics.misses, 0);
     });
 
     test('serves the cached entry for a 304 reported as an error', () async {

@@ -57,5 +57,9 @@ abstract class ApiAdapter {
   ///
   /// If [force] is `true`, active connections are terminated immediately.
   /// Otherwise, the adapter waits for pending requests to complete.
+  ///
+  /// The built-in adapters fail network calls started after [close] (new
+  /// requests and retries) with a [ConfigurationException], which is not
+  /// retried.
   void close({bool force = false});
 }

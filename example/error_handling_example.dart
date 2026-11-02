@@ -56,10 +56,10 @@ void main() async {
   │   ├── BadGatewayException         (502)
   │   ├── ServiceUnavailableException (503)
   │   └── GatewayTimeoutException     (504)
-  ├── SerializationException
-  ├── RetryLimitExceededException
-  ├── ConfigurationException
-  └── CacheException
+  ├── SerializationException      (body not encodable/decodable, wrong type)
+  ├── ConfigurationException      (invalid URL, adapter closed)
+  ├── RetryLimitExceededException (not thrown by api_plus; for your code)
+  └── CacheException              (not thrown by api_plus; for your code)
   ''');
 
   api.close();

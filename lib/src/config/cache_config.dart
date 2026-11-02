@@ -24,8 +24,10 @@ class CacheConfig {
 
   /// Default time-to-live for cache entries.
   ///
-  /// Used when the response does not contain `Cache-Control: max-age`
-  /// or similar directives.
+  /// Used only when the response has neither `Cache-Control: max-age` nor
+  /// an `Expires` header. `max-age` wins over `Expires`; an `Expires` date
+  /// in the past or that cannot be parsed (e.g. `0` or `-1`) stores the
+  /// response as already expired, so it is revalidated before use.
   final Duration defaultTtl;
 
   /// Maximum age for stale entries to be served during network failures
@@ -33,7 +35,9 @@ class CacheConfig {
   ///
   /// When a network request fails with a [NetworkException] and a cache
   /// entry exists that is younger than [staleTtl] (measured from when it
-  /// was cached or last revalidated), that entry is served instead.
+  /// was cached or last revalidated), that entry is served instead. With a
+  /// `RetryInterceptor` placed before the cache interceptor (the
+  /// `ApiBuilder` order), this happens only after the retries are used up.
   final Duration staleTtl;
 
   /// When `true`, always serves from cache if available, ignoring
@@ -46,8 +50,9 @@ class CacheConfig {
   /// Custom function for generating cache keys.
   ///
   /// Receives the HTTP method and the request path including its query
-  /// parameters (sorted by name), e.g. `/users?page=2`. When `null`, a
-  /// default key based on method, path, and query parameters is used.
+  /// parameters (sorted by name), e.g. `/users?page=2`. When `null`, the
+  /// key is `CacheKeyGenerator.generate(method, path, queryParameters)`,
+  /// which apps can use to delete a single entry from the store.
   ///
   /// Request headers are not part of the default key. If responses depend
   /// on the caller (e.g. the `Authorization` header), include that in your
@@ -67,6 +72,9 @@ class CacheConfig {
   /// `If-None-Match`/`If-Modified-Since` when available). The refreshed
   /// response is stored for subsequent requests. A failed refresh leaves
   /// the stale entry in place.
+  ///
+  /// Responses stored with `Cache-Control: no-cache` or `must-revalidate`
+  /// are never served this way: they are revalidated before use.
   final bool enableStaleWhileRevalidate;
 
   /// Whether to collect cache metrics.

@@ -2,6 +2,8 @@ import 'dart:convert';
 import '../config/logger_config.dart';
 import '../core/api_request.dart';
 import '../core/api_response.dart';
+import '../core/internal_keys.dart';
+import '../core/request_url.dart';
 import '../exceptions/api_exception.dart';
 import '../interfaces/api_interceptor.dart';
 
@@ -52,29 +54,36 @@ class LoggerInterceptor implements ApiInterceptor {
 
   @override
   Future<dynamic> onRequest(ApiRequest request) async {
-    if (!config.isEnabled(LogLevel.info)) return request;
+    var current = request;
+    if (config.isEnabled(LogLevel.error)) {
+      // Lets a RetryInterceptor placed before this one report the first
+      // attempt's error before it retries, so every attempt's error is
+      // logged once, in order.
+      current = withErrorObserver(current, _logErrorOnce);
+    }
+    if (!config.isEnabled(LogLevel.info)) return current;
 
     // Check request filter
-    if (config.requestFilter != null && !config.requestFilter!(request)) {
-      return request;
+    if (config.requestFilter != null && !config.requestFilter!(current)) {
+      return current;
     }
 
     // Attach start time for execution time tracking
-    final newExtra = Map<String, dynamic>.from(request.extra);
+    final newExtra = Map<String, dynamic>.from(current.extra);
     newExtra['_requestStartTime'] = DateTime.now().millisecondsSinceEpoch;
-    final finalRequest = request.copyWith(extra: newExtra);
+    final finalRequest = current.copyWith(extra: newExtra);
 
     switch (config.format) {
       case LogFormat.json:
+        // The curl command is a field of the record, so every line of
+        // JSON output is valid JSON.
         _logJsonRequest(finalRequest);
       case LogFormat.pretty:
         _logPrettyRequest(finalRequest);
+        if (config.printCurl) _logCurlCommand(finalRequest);
       case LogFormat.compact:
         _logCompactRequest(finalRequest);
-    }
-
-    if (config.printCurl) {
-      _logCurlCommand(finalRequest);
+        if (config.printCurl) _logCurlCommand(finalRequest);
     }
 
     return finalRequest;
@@ -118,11 +127,27 @@ class LoggerInterceptor implements ApiInterceptor {
     ApiException error,
     Future<ApiResponse<dynamic>> Function(ApiRequest) invoker,
   ) async {
-    if (!config.isEnabled(LogLevel.error)) return error;
+    _logErrorOnce(error);
+    return error;
+  }
+
+  /// Errors this logger has already logged. With retries, the final error
+  /// of the last attempt reaches [onError] twice (from the last attempt and
+  /// from the retry loop); it is logged once.
+  final Expando<bool> _loggedErrors = Expando<bool>('apiPlusLoggedError');
+
+  void _logErrorOnce(ApiException error) {
+    if (_loggedErrors[error] ?? false) return;
+    _loggedErrors[error] = true;
+    _logError(error);
+  }
+
+  void _logError(ApiException error) {
+    if (!config.isEnabled(LogLevel.error)) return;
     if (config.requestFilter != null &&
         error.request != null &&
         !config.requestFilter!(error.request!)) {
-      return error;
+      return;
     }
 
     final executionTime = _getExecutionTime(error.request);
@@ -139,8 +164,9 @@ class LoggerInterceptor implements ApiInterceptor {
             '$color┌── Error ────────────────────────────────────────────────────$reset');
         buffer.writeln('$color│ ${reset}ERROR: ${error.message}');
         if (error.request != null) {
-          buffer.writeln(
-              '$color│ ${reset}Request: ${error.request!.method.value} ${error.request!.path}');
+          buffer.writeln('$color│ ${reset}Request: '
+              '${error.request!.method.value} '
+              '${_maskPathQuery(error.request!.path)}');
         }
         if (error.response != null) {
           buffer
@@ -154,8 +180,6 @@ class LoggerInterceptor implements ApiInterceptor {
             '$color└────────────────────────────────────────────────────────────$reset');
         _log(buffer.toString());
     }
-
-    return error;
   }
 
   // ─── Utility Methods ─────────────────────────────────────────────
@@ -170,10 +194,17 @@ class LoggerInterceptor implements ApiInterceptor {
   }
 
   late final Set<String> _maskedKeys =
-      config.maskedKeys.map((k) => k.toLowerCase()).toSet();
+      config.maskedKeys.map(_normalizeKey).toSet();
+
+  static final _keySeparators = RegExp(r'[\s_\-]');
+
+  /// Lower-cases [key] and drops `_`, `-` and whitespace, so `accessToken`,
+  /// `access-token` and `ACCESS_TOKEN` all match `access_token`.
+  static String _normalizeKey(String key) =>
+      key.toLowerCase().replaceAll(_keySeparators, '');
 
   bool _isMasked(Object? key) =>
-      key is String && _maskedKeys.contains(key.toLowerCase());
+      key is String && _maskedKeys.contains(_normalizeKey(key));
 
   Map<String, String> _maskHeaders(Map<String, String> headers) {
     return headers.map(
@@ -229,18 +260,69 @@ class LoggerInterceptor implements ApiInterceptor {
 
   static Object? _toEncodable(Object? value) => value.toString();
 
-  static String _describePath(ApiRequest request) {
-    if (request.queryParameters.isEmpty) return request.path;
-    final params = <String, dynamic>{
-      for (final entry in request.queryParameters.entries)
-        if (entry.value != null)
-          entry.key: entry.value is Iterable
-              ? (entry.value as Iterable).map((e) => '$e').toList()
-              : '${entry.value}',
-    };
-    if (params.isEmpty) return request.path;
-    final separator = request.path.contains('?') ? '&' : '?';
-    return '${request.path}$separator${Uri(queryParameters: params).query}';
+  /// The request path with its query parameters, with masked keys'
+  /// values replaced (in [ApiRequest.queryParameters] and in a query string
+  /// that is part of [ApiRequest.path]).
+  String _describePath(ApiRequest request) {
+    final path = _maskPathQuery(request.path);
+    final parts = <String>[];
+    request.queryParameters.forEach((key, value) {
+      if (value == null) return;
+      if (_isMasked(key)) {
+        parts.add(_queryPart(key, config.maskString, encodeValue: false));
+      } else if (value is Iterable) {
+        for (final item in value) {
+          parts.add(_queryPart(key, '$item'));
+        }
+      } else {
+        parts.add(_queryPart(key, '$value'));
+      }
+    });
+    if (parts.isEmpty) return path;
+    final separator = path.contains('?') ? '&' : '?';
+    return '$path$separator${parts.join('&')}';
+  }
+
+  /// Encodes one `key=value` pair like [Uri.queryParameters] does. The mask
+  /// string is written as-is so it stays readable.
+  static String _queryPart(
+    String key,
+    String value, {
+    bool encodeValue = true,
+  }) {
+    final encodedKey = Uri.encodeQueryComponent(key);
+    if (value.isEmpty) return encodedKey;
+    return '$encodedKey='
+        '${encodeValue ? Uri.encodeQueryComponent(value) : value}';
+  }
+
+  /// Masks the values of masked keys in a query string that is part of
+  /// [path]. Other parts of the path are left exactly as they are.
+  String _maskPathQuery(String path) {
+    final queryStart = path.indexOf('?');
+    if (queryStart < 0) return path;
+    final fragmentStart = path.indexOf('#', queryStart);
+    final queryEnd = fragmentStart < 0 ? path.length : fragmentStart;
+    final query = path.substring(queryStart + 1, queryEnd);
+    if (query.isEmpty) return path;
+
+    var changed = false;
+    final pairs = query.split('&').map((pair) {
+      final equals = pair.indexOf('=');
+      final rawKey = equals < 0 ? pair : pair.substring(0, equals);
+      String key;
+      try {
+        key = Uri.decodeQueryComponent(rawKey);
+      } catch (_) {
+        key = rawKey;
+      }
+      if (!_isMasked(key)) return pair;
+      changed = true;
+      return '$rawKey=${config.maskString}';
+    }).toList();
+    if (!changed) return path;
+    return '${path.substring(0, queryStart + 1)}${pairs.join('&')}'
+        '${path.substring(queryEnd)}';
   }
 
   // ─── JSON Formatting ─────────────────────────────────────────────
@@ -253,6 +335,7 @@ class LoggerInterceptor implements ApiInterceptor {
       if (config.printRequestHeaders) 'headers': _maskHeaders(request.headers),
       if (config.printRequestBody && request.body != null)
         'body': _maskBody(request.body),
+      if (config.printCurl) 'curl': _curlCommand(request),
     };
     _log(_encode(logData));
   }
@@ -376,6 +459,14 @@ class LoggerInterceptor implements ApiInterceptor {
   // ─── Curl Generation ─────────────────────────────────────────────
 
   void _logCurlCommand(ApiRequest request) {
+    final color = config.colors ? '\x1B[36m' : ''; // Cyan
+    final reset = config.colors ? '\x1B[0m' : '';
+    _log('$color${_curlCommand(request)}$reset');
+  }
+
+  /// The curl command for [request], with masked values and the full URL
+  /// (the adapter's base URL joined with the path).
+  String _curlCommand(ApiRequest request) {
     final curl = StringBuffer('curl -X ${request.method.value}');
 
     _maskHeaders(request.headers).forEach((key, value) {
@@ -388,11 +479,21 @@ class LoggerInterceptor implements ApiInterceptor {
       curl.write(" -d '${bodyStr.replaceAll("'", "'\\''")}'");
     }
 
-    curl.write(' "${_describePath(request)}"');
+    curl.write(' "${_describeUrl(request)}"');
+    return curl.toString();
+  }
 
-    final color = config.colors ? '\x1B[36m' : ''; // Cyan
-    final reset = config.colors ? '\x1B[0m' : '';
-    _log('$color$curl$reset');
+  /// [_describePath] prefixed with the adapter's base URL, unless the path
+  /// is already an absolute URL.
+  String _describeUrl(ApiRequest request) {
+    final path = _describePath(request);
+    final base = request.extra[baseUrlExtraKey];
+    if (base is! String || base.isEmpty || looksLikeAbsoluteUrl(path)) {
+      return path;
+    }
+    final trimmedBase =
+        base.endsWith('/') ? base.substring(0, base.length - 1) : base;
+    return path.startsWith('/') ? '$trimmedBase$path' : '$trimmedBase/$path';
   }
 
   String _tryFormatJson(dynamic data) {

@@ -15,6 +15,11 @@ import '../utils/http_date_parser.dart';
 /// connectivity-aware retries, Retry-After header support, and
 /// retry metrics collection.
 ///
+/// Place it before a `CacheInterceptor` (as `ApiBuilder` and
+/// `RetrofitAdapter` do), so failed requests are retried before a stale
+/// cache entry is served. Errors that are not [ApiException]s (e.g. a bug in
+/// another interceptor) are propagated unchanged and never retried.
+///
 /// {@tool snippet}
 /// ```dart
 /// final retry = RetryInterceptor(
@@ -63,7 +68,9 @@ class RetryInterceptor implements ApiInterceptor {
   /// Each retry is sent through [invoker], i.e. through the adapter's
   /// complete interceptor pipeline, so other interceptors (logging, caching)
   /// observe every attempt. Returns the successful [ApiResponse], or the
-  /// [ApiException] of the last attempt.
+  /// [ApiException] of the last attempt. A retry is not started if its delay
+  /// would exceed [RetryConfig.maxDelay] or end after
+  /// [RetryConfig.maxElapsedDuration].
   @override
   Future<dynamic> onError(
     ApiException error,
@@ -75,7 +82,7 @@ class RetryInterceptor implements ApiInterceptor {
     }
     // This attempt was sent by a retry loop that is already running further
     // up the call stack; that loop decides whether to try again.
-    if (request.extra[retryAttemptExtraKey] == true) {
+    if (isRetryAttempt(request)) {
       return error;
     }
     // Cancelled requests are never retried.
@@ -84,6 +91,23 @@ class RetryInterceptor implements ApiInterceptor {
       return error;
     }
 
+    final lastError = await _retry(error, request, cancelToken, invoker);
+    if (lastError is ApiException) {
+      // Let later interceptors (e.g. the cache's stale fallback) know that
+      // this error will not be retried any more.
+      markRetryFinished(lastError);
+    }
+    return lastError;
+  }
+
+  /// Runs the retry loop. Returns the successful [ApiResponse] or the
+  /// [ApiException] to propagate.
+  Future<dynamic> _retry(
+    ApiException error,
+    ApiRequest request,
+    ApiCancelToken? cancelToken,
+    Future<ApiResponse<dynamic>> Function(ApiRequest) invoker,
+  ) async {
     var attempt = request.extra['_retryCount'] as int? ?? 0;
     final int? firstAttemptMs = request.extra['_firstAttemptTime'] as int?;
     final DateTime? firstAttemptTime = firstAttemptMs != null
@@ -101,6 +125,19 @@ class RetryInterceptor implements ApiInterceptor {
       }
 
       final delay = _delayFor(lastError, attempt + 1);
+      // A wait longer than maxDelay (e.g. a large Retry-After) or one that
+      // would end after maxElapsedDuration is never started: give up now
+      // and surface the current error (its response keeps the header).
+      if (delay > config.maxDelay ||
+          _exceedsElapsedBudget(firstAttemptTime, delay)) {
+        break;
+      }
+      if (!retried) {
+        // Interceptors after this one (e.g. the logger) only see the final
+        // error; let them observe the first attempt's error now. The errors
+        // of the retries go through the whole pipeline anyway.
+        notifyErrorObservers(lastError);
+      }
       config.onRetry?.call(attempt + 1, delay);
       if (!await _wait(delay, cancelToken)) {
         // Cancelled while waiting: the retry never happened.
@@ -126,13 +163,13 @@ class RetryInterceptor implements ApiInterceptor {
       } on ApiException catch (e) {
         lastError = e;
         if (e is CancellationException) break;
-      } catch (e, stackTrace) {
-        lastError = NetworkException(
-          message: 'Unexpected error during retry: $e',
-          request: newRequest,
-          error: e,
-          stackTrace: stackTrace,
-        );
+      } catch (_) {
+        // Not an ApiException (e.g. a bug in another interceptor): it is
+        // propagated unchanged and not retried.
+        if (config.enableMetrics) {
+          metrics.recordFailure();
+        }
+        rethrow;
       }
     }
 
@@ -149,14 +186,29 @@ class RetryInterceptor implements ApiInterceptor {
     if (cancelToken?.isCancelled ?? false) return Future.value(false);
     if (delay <= Duration.zero) return Future.value(true);
     final completer = Completer<bool>();
+    void Function()? removeListener;
     final timer = Timer(delay, () {
+      // Unregister, so a long-lived token does not keep this request alive.
+      removeListener?.call();
       if (!completer.isCompleted) completer.complete(true);
     });
-    cancelToken?.whenCancelled.then((_) {
+    removeListener = cancelToken?.addCancelListener(() {
       timer.cancel();
       if (!completer.isCompleted) completer.complete(false);
     });
     return completer.future;
+  }
+
+  /// Whether waiting [delay] would end after [RetryConfig.maxElapsedDuration]
+  /// (which a custom strategy replaces, as in [_shouldRetry]).
+  bool _exceedsElapsedBudget(DateTime? firstAttemptTime, Duration delay) {
+    final budget = config.maxElapsedDuration;
+    if (config.customStrategy != null ||
+        budget == null ||
+        firstAttemptTime == null) {
+      return false;
+    }
+    return DateTime.now().difference(firstAttemptTime) + delay > budget;
   }
 
   Duration _delayFor(ApiException error, int attempt) {
