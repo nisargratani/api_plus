@@ -282,7 +282,8 @@ void main() {
       expect(result, isA<NetworkException>());
     });
 
-    test('handles invoker throwing unexpected error', () async {
+    test('propagates non-ApiException errors from the invoker unchanged',
+        () async {
       final interceptor = RetryInterceptor(
         config: const RetryConfig(
           maxRetries: 3,
@@ -299,11 +300,16 @@ void main() {
       );
       final error = NetworkException(message: 'Error', request: request);
 
-      final result = await interceptor.onError(error, (req) async {
-        throw Exception('Unexpected');
-      });
-
-      expect(result, isA<NetworkException>());
+      final unexpected = Exception('Unexpected');
+      var calls = 0;
+      await expectLater(
+        interceptor.onError(error, (req) async {
+          calls++;
+          throw unexpected;
+        }),
+        throwsA(same(unexpected)),
+      );
+      expect(calls, 1, reason: 'the error must not be retried');
     });
   });
 

@@ -1,5 +1,7 @@
 import 'dart:async';
 
+import 'package:meta/meta.dart';
+
 import 'api_request.dart';
 
 /// Cancels in-flight requests.
@@ -35,6 +37,11 @@ class ApiCancelToken {
   final Completer<void> _completer = Completer<void>();
   Object? _reason;
 
+  /// Callbacks of the requests currently using this token. Requests remove
+  /// theirs when they finish, so a long-lived token does not keep completed
+  /// requests reachable.
+  final Set<_CancelListener> _listeners = <_CancelListener>{};
+
   /// Creates a token that is not cancelled.
   ApiCancelToken();
 
@@ -54,5 +61,42 @@ class ApiCancelToken {
     if (isCancelled) return;
     _reason = reason;
     _completer.complete();
+    final listeners = List<_CancelListener>.of(_listeners);
+    _listeners.clear();
+    for (final listener in listeners) {
+      try {
+        listener.callback();
+      } catch (error, stackTrace) {
+        Zone.current.handleUncaughtError(error, stackTrace);
+      }
+    }
   }
+
+  /// Registers [callback] to run when [cancel] is called, and returns a
+  /// function that unregisters it.
+  ///
+  /// Unlike listening to [whenCancelled], the registration can be removed,
+  /// so request-scoped callbacks don't keep requests alive after they
+  /// finish. If the token is already cancelled, [callback] runs immediately.
+  ///
+  /// Used by the adapters and interceptors of this package.
+  @internal
+  void Function() addCancelListener(void Function() callback) {
+    if (isCancelled) {
+      callback();
+      return _noop;
+    }
+    final listener = _CancelListener(callback);
+    _listeners.add(listener);
+    return () => _listeners.remove(listener);
+  }
+
+  static void _noop() {}
+}
+
+/// Identity wrapper, so the same callback can be registered more than once.
+final class _CancelListener {
+  _CancelListener(this.callback);
+
+  final void Function() callback;
 }

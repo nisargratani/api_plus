@@ -25,7 +25,8 @@ class HttpDateParser {
   /// Parses an HTTP-date string into a [DateTime].
   ///
   /// Supports IMF-fixdate, RFC 850, and asctime formats.
-  /// Returns `null` if the string cannot be parsed.
+  /// Returns `null` if the string cannot be parsed or names a date or time
+  /// that does not exist (e.g. `31 Feb` or `25:61:61`).
   ///
   /// Example:
   /// ```dart
@@ -85,6 +86,8 @@ class HttpDateParser {
     return null;
   }
 
+  /// Builds the UTC date, or returns `null` for impossible values (e.g.
+  /// 31 Feb or 25:61:61), which `DateTime.utc` would silently roll over.
   static DateTime? _buildDate({
     required int day,
     int? month,
@@ -94,10 +97,14 @@ class HttpDateParser {
     required int second,
   }) {
     if (month == null) return null;
-    try {
-      return DateTime.utc(year, month, day, hour, minute, second);
-    } catch (_) {
+    if (day < 1 || day > 31) return null;
+    if (hour > 23 || minute > 59 || second > 60) return null;
+    // A leap second is clamped to the last second of the minute.
+    final date = DateTime.utc(
+        year, month, day, hour, minute, second == 60 ? 59 : second);
+    if (date.year != year || date.month != month || date.day != day) {
       return null;
     }
+    return date;
   }
 }

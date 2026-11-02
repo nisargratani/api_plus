@@ -141,7 +141,7 @@ class ApiBuilder {
   /// Adds a custom interceptor to the pipeline.
   ///
   /// Custom interceptors are executed after the built-in interceptors
-  /// (cache, retry, logger).
+  /// (retry, cache, logger).
   ApiBuilder addInterceptor(ApiInterceptor interceptor) {
     _customInterceptors.add(interceptor);
     return this;
@@ -150,19 +150,22 @@ class ApiBuilder {
   /// Builds the configured [ApiAdapter].
   ///
   /// The interceptor execution order is:
-  /// 1. Cache (short-circuits if hit)
-  /// 2. Retry (handles retrying on failure)
+  /// 1. Retry (retries failed requests through the whole pipeline)
+  /// 2. Cache (short-circuits on a hit; serves a stale entry when the
+  ///    network fails, but only after the retry interceptor gives up)
   /// 3. Logger (logs requests/responses)
   /// 4. Custom interceptors (in order added)
+  ///
+  /// Each hook (`onRequest`, `onResponse`, `onError`) runs in this order.
   ApiAdapter build() {
     final interceptors = <ApiInterceptor>[];
 
-    if (_cacheConfig != null) {
-      interceptors.add(CacheInterceptor(config: _cacheConfig!));
-    }
-
     if (_retryConfig != null) {
       interceptors.add(RetryInterceptor(config: _retryConfig!));
+    }
+
+    if (_cacheConfig != null) {
+      interceptors.add(CacheInterceptor(config: _cacheConfig!));
     }
 
     if (_loggerConfig != null) {

@@ -91,13 +91,31 @@ class LoggerConfig {
 
   /// Keys whose values should be masked in log output.
   ///
-  /// Matched case-insensitively against request and response header names
-  /// and against keys of JSON/map bodies (at any depth). Values for
-  /// matching keys are replaced with [maskString] in every log format and
-  /// in the generated curl command.
+  /// Matched against request and response header names, keys of JSON/map
+  /// bodies (at any depth, including JSON strings), and query parameter
+  /// names (in [ApiRequest.queryParameters] and in a query string in the
+  /// path). Values for matching keys are replaced with [maskString] in
+  /// every log format and in the generated curl command.
+  ///
+  /// Keys are compared after normalisation: both the configured keys and
+  /// the actual keys are lower-cased, and `_`, `-` and whitespace are
+  /// removed. So `access_token` also masks `accessToken`, `access-token`,
+  /// and `ACCESS_TOKEN`, and `x-api-key` also masks `xApiKey`.
+  ///
+  /// The defaults cover common credential headers and fields:
+  /// `authorization`, `proxy-authorization`, `cookie`, `set-cookie`,
+  /// `x-api-key`, `api_key`, `password`, `token`, `access_token`,
+  /// `refresh_token`, `id_token`, `secret`, and `client_secret`. Setting
+  /// this field replaces the defaults; include them if you only want to
+  /// add keys.
   final Set<String> maskedKeys;
 
   /// Whether to include the equivalent curl command for each request.
+  ///
+  /// The command uses the full URL (the adapter's base URL joined with the
+  /// path) and masks values as described in [maskedKeys]. With
+  /// [LogFormat.json] it is the `curl` field of the request record, so every
+  /// line of output stays valid JSON; otherwise it is logged on its own line.
   final bool printCurl;
 
   /// The string used to replace masked values.
@@ -144,6 +162,7 @@ class LoggerConfig {
       'token',
       'access_token',
       'refresh_token',
+      'id_token',
       'secret',
       'client_secret',
     },

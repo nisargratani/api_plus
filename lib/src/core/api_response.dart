@@ -68,7 +68,8 @@ class ApiResponse<T> {
 
   /// Creates a copy of this response with the given fields replaced.
   ///
-  /// Any field not provided will retain its current value.
+  /// Any field not provided, or passed as `null`, keeps its current value.
+  /// To remove a nullable field (e.g. the [data]), use [copyWithout].
   ApiResponse<T> copyWith({
     T? data,
     int? statusCode,
@@ -84,6 +85,29 @@ class ApiResponse<T> {
       statusMessage: statusMessage ?? this.statusMessage,
       isRedirect: isRedirect ?? this.isRedirect,
       request: request ?? this.request,
+    );
+  }
+
+  /// Creates a copy of this response without the selected nullable fields.
+  ///
+  /// [copyWith] cannot clear a field, because `null` means "keep the
+  /// current value". Pass `true` for each field to remove:
+  ///
+  /// ```dart
+  /// final empty = response.copyWithout(data: true);
+  /// ```
+  ApiResponse<T> copyWithout({
+    bool data = false,
+    bool statusMessage = false,
+    bool request = false,
+  }) {
+    return ApiResponse<T>(
+      data: data ? null : this.data,
+      statusCode: statusCode,
+      headers: headers,
+      statusMessage: statusMessage ? null : this.statusMessage,
+      isRedirect: isRedirect,
+      request: request ? null : this.request,
     );
   }
 

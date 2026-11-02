@@ -39,10 +39,13 @@ class CacheEntry {
 
   /// Returns `true` if this entry has expired based on [expiresAt].
   ///
-  /// Returns `false` if [expiresAt] is `null` (entry never expires).
+  /// An entry expires at [expiresAt] (inclusive), so an entry stored with
+  /// a zero lifetime (`no-cache`, `max-age=0`, a past `Expires`) is always
+  /// expired. Returns `false` if [expiresAt] is `null` (entry never
+  /// expires).
   bool get isExpired {
     if (expiresAt == null) return false;
-    return DateTime.now().isAfter(expiresAt!);
+    return !DateTime.now().isBefore(expiresAt!);
   }
 
   /// Returns the age of this cache entry.

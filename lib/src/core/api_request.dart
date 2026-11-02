@@ -103,7 +103,9 @@ class ApiRequest {
 
   /// Creates a copy of this request with the given fields replaced.
   ///
-  /// Any field not provided will retain its current value.
+  /// Any field not provided, or passed as `null`, keeps its current value.
+  /// To remove a nullable field (e.g. the [body] or the [cancelToken]), use
+  /// [copyWithout].
   ApiRequest copyWith({
     String? path,
     HttpMethod? method,
@@ -127,6 +129,35 @@ class ApiRequest {
       sendTimeout: sendTimeout ?? this.sendTimeout,
       extra: extra ?? this.extra,
       cancelToken: cancelToken ?? this.cancelToken,
+    );
+  }
+
+  /// Creates a copy of this request without the selected nullable fields.
+  ///
+  /// [copyWith] cannot clear a field, because `null` means "keep the
+  /// current value". Pass `true` for each field to remove:
+  ///
+  /// ```dart
+  /// final get = post.copyWith(method: HttpMethod.get).copyWithout(body: true);
+  /// ```
+  ApiRequest copyWithout({
+    bool body = false,
+    bool connectTimeout = false,
+    bool receiveTimeout = false,
+    bool sendTimeout = false,
+    bool cancelToken = false,
+  }) {
+    return ApiRequest(
+      path: path,
+      method: method,
+      headers: headers,
+      queryParameters: queryParameters,
+      body: body ? null : this.body,
+      connectTimeout: connectTimeout ? null : this.connectTimeout,
+      receiveTimeout: receiveTimeout ? null : this.receiveTimeout,
+      sendTimeout: sendTimeout ? null : this.sendTimeout,
+      extra: extra,
+      cancelToken: cancelToken ? null : this.cancelToken,
     );
   }
 

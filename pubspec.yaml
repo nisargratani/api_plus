@@ -2,7 +2,7 @@ name: api_plus
 description: >-
   Adapter-based Dart networking with shared retry, HTTP caching (ETag,
   stale-while-revalidate), and logging interceptors for Dio, http, and Retrofit.
-version: 0.0.3
+version: 0.0.4
 homepage: https://github.com/nisargratani/api_plus
 repository: https://github.com/nisargratani/api_plus
 issue_tracker: https://github.com/nisargratani/api_plus/issues

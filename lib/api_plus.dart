@@ -25,7 +25,8 @@
 ///
 /// - Use [ApiBuilder] for a fluent configuration experience
 /// - Use [DioAdapter], [HttpAdapter], or [RetrofitAdapter] directly
-/// - Implement [ApiAdapter] for custom HTTP clients
+/// - Implement [ApiAdapter] (with [InterceptorPipeline]) for custom HTTP
+///   clients
 /// - Implement [CacheStore] for custom cache backends
 library;
 
@@ -59,6 +60,7 @@ export 'src/models/retry_metrics.dart';
 export 'src/builders/api_builder.dart';
 
 // Adapters
+export 'src/adapters/adapter_mixin.dart' show InterceptorPipeline;
 export 'src/adapters/dio/dio_adapter.dart';
 export 'src/adapters/http/http_adapter.dart';
 export 'src/adapters/retrofit/retrofit_adapter.dart';

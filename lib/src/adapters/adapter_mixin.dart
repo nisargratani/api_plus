@@ -10,14 +10,43 @@ import '../interfaces/api_adapter.dart';
 
 /// Mixin that provides the shared interceptor pipeline for all adapters.
 ///
-/// This mixin eliminates code duplication by extracting the common
-/// interceptor execution logic (onRequest, onResponse, onError) that
-/// is identical across all adapter implementations.
+/// `HttpAdapter` and `DioAdapter` use it, and so can your own [ApiAdapter]
+/// for another HTTP client: implement only the raw network call and pass it
+/// to [runPipeline]. Retry, caching (including stale-while-revalidate), and
+/// logging then work exactly as with the built-in adapters.
 ///
 /// {@tool snippet}
 /// ```dart
 /// class MyAdapter extends ApiAdapter with InterceptorPipeline {
-///   // Only implement the raw network call
+///   MyAdapter({required this.baseUrl, this.interceptors = const []});
+///
+///   @override
+///   final String baseUrl;
+///
+///   @override
+///   final List<ApiInterceptor> interceptors;
+///
+///   @override
+///   Map<String, String> get defaultHeaders => const {};
+///
+///   @override
+///   Future<ApiResponse<T>> request<T>(ApiRequest request) =>
+///       runPipeline<T>(request, _send);
+///
+///   /// Returns the response for any status code; throws a
+///   /// NetworkException (or another ApiException) for transport failures.
+///   Future<ApiResponse<dynamic>> _send(ApiRequest request) async {
+///     final raw = await myClient.send(baseUrl, request);
+///     return ApiResponse<dynamic>(
+///       data: raw.data,
+///       statusCode: raw.statusCode,
+///       headers: raw.headers, // lower-case names
+///       request: request,
+///     );
+///   }
+///
+///   @override
+///   void close({bool force = false}) => myClient.close();
 /// }
 /// ```
 /// {@end-tool}
@@ -29,6 +58,7 @@ mixin InterceptorPipeline on ApiAdapter {
   Future<dynamic> runOnRequest(ApiRequest request) async {
     final mergedRequest = request.copyWith(
       headers: {...defaultHeaders, ...request.headers},
+      extra: {...request.extra, baseUrlExtraKey: baseUrl},
     );
 
     dynamic current = mergedRequest;
@@ -96,8 +126,16 @@ mixin InterceptorPipeline on ApiAdapter {
     }
     final dynamic requestResult = await runOnRequest(request);
     if (requestResult is ApiResponse) {
-      _scheduleRevalidation(requestResult.request);
-      return castResponse<T>(requestResult, request);
+      final servedFor = requestResult.request;
+      _scheduleRevalidation(servedFor);
+      // The revalidation marker is internal; don't hand it to the caller.
+      final response = servedFor?.extra[revalidateExtraKey] == true
+          ? withRequest<dynamic>(
+              requestResult,
+              withoutExtra(servedFor!, revalidateExtraKey),
+            )
+          : requestResult;
+      return castResponse<T>(response, request);
     }
     final finalRequest = requestResult as ApiRequest;
 
@@ -105,12 +143,7 @@ mixin InterceptorPipeline on ApiAdapter {
     try {
       response = await runOnResponse(await send(finalRequest));
       if (!response.isSuccessful) {
-        throw ServerException.fromResponse(
-          message: 'Server returned ${response.statusCode}'
-              '${response.statusMessage != null ? ': ${response.statusMessage}' : ''}',
-          request: finalRequest,
-          response: response,
-        );
+        throw serverExceptionFor(finalRequest, response);
       }
     } on ApiException catch (e) {
       return runOnError<T>(e);
